@@ -1,0 +1,24 @@
+Paste this into Claude on the VM (started from ~/myproject), after uploading pcapkit.zip to your home folder.
+
+-----------------------------------------------------------------------------------------------------------
+THIS IS HFT! NOT SHEEPLE CODING!!!
+Test the new pcapkit on the real course data. Follow pcapkit/CLAUDE.md and the class rules. Check df -h / first;
+stop if free space would drop under 5 GB. Read-only on /db_pcaps and /md. Short replies, summaries only.
+
+1. Unzip ~/pcapkit.zip into ~/myproject/pcapkit, delete the zip, run: bash build.sh. Report what built.
+2. Engine sync: our VM parser folder (the one we used for the Feb-Apr export) has newer code than pcapkit/engine
+   (reader-side filtering, trade_id in ticks, get_data.sh, check_export.py). Compare them. Where the VM version is
+   newer, copy it into pcapkit/engine, rebuild, and run engine/bench_v3.sh on one real day to prove v1 and v3
+   output are still byte-identical. List which files you replaced.
+3. Scan: python3 kit.py scan --peek 4 (all of /db_pcaps and /md/iex_pcaps). Show the summary table only:
+   venue, protocol, files, days, GB, date range. Say if any file came back not-pcap, unreadable or udp-unknown.
+4. Small real pull: set prefs.ini to venues = nasdaq, cme; symbols = QQQ, TQQQ, SQQQ;
+   cme_instruments = NQH5=42288528, NQM5=42005804@20250317; from = 20250203; to = 20250204;
+   weekdays = mon, tue, wed, thu; start = 18:00; end = 18:30; bars = 1; ticks = yes; out_dir = out_kittest.
+   Run python3 kit.py plan, show it, then run it in the background and report each day.
+5. Check against our earlier export: if any earlier 2025-02-03 bars/ticks are still on the VM, compare the
+   18:00-18:30 rows for QQQ, TQQQ, SQQQ and NQ (row counts, first/last prices, volume). If they're gone, run
+   check_export.py on out_kittest instead. Report match / mismatch with numbers.
+6. Clean up: delete out_kittest and catalog.tsv when I've seen the results. End with a "cleaned:" line.
+Don't push anything to git. Tell me what needs fixing before this goes public.
+-----------------------------------------------------------------------------------------------------------

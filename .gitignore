@@ -1,0 +1,22 @@
+# code only - never commit data or build output
+out/
+catalog.tsv
+*.log
+*.pcap
+*.pcap.zst
+*.pcap.gz
+*.zst
+*.gz
+*.parquet
+*.csv
+bars_*.txt
+ticks_*
+pcap_scan
+engine/itch_fast
+engine/itch_fast2
+engine/itch_fast3
+engine/mdp3_fast
+engine/mdp3_fast2
+engine/mdp3_fast3
+__pycache__/
+.DS_Store
