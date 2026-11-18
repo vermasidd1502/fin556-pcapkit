@@ -125,9 +125,12 @@ def stream_trades(src, dst, win, w0, w1):
 
 def parse_nasdaq(args, day, base, files_out, ticks, w0, w1):
     # always read from 04:00 ET so every order book is complete
-    files = select_files(args.xnas_root, day, et_ns(day, "04:00"), et_ns(day, "20:00"))
+    if args.files:  # explicit list (one path per line), e.g. picked by pcapkit from its catalog
+        files = [l.strip() for l in open(args.files) if l.strip()]
+    else:
+        files = select_files(args.xnas_root, day, et_ns(day, "04:00"), et_ns(day, "20:00"))
     if not files:
-        sys.exit(f"no Nasdaq files found for {args.date} under {args.xnas_root}")
+        sys.exit(f"no Nasdaq files found for {args.date} under {args.files or args.xnas_root}")
     exe = next((os.path.join(HERE, b) for b in ("itch_fast3", "itch_fast2", "itch_fast")
                 if os.access(os.path.join(HERE, b), os.X_OK)), "")
     if not os.access(exe, os.X_OK):
@@ -259,6 +262,7 @@ def main():
     ap.add_argument("--end", default="20:00", help="window end, New York time")
     ap.add_argument("--ticks", action="store_true", help="also write every quote and trade in the window")
     ap.add_argument("--xnas-root", default="/db_pcaps/xnas_pcaps")
+    ap.add_argument("--files", help="text file listing the Nasdaq capture files to read, in time order (overrides --xnas-root)")
     ap.add_argument("--out-dir", default="out")
     ap.add_argument("--no-nq", action="store_true", help="leave NQ out")
     ap.add_argument("--force", action="store_true", help="parse the Nasdaq files again")

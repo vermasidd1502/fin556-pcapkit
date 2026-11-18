@@ -4,6 +4,11 @@ A small C++ toolkit for the course VM. It **finds** every packet capture on the 
 (exchange, protocol, dates, sizes), then **pulls** exactly the data you ask for (venues, symbols, dates, time window)
 into small text files: 1-minute (or any size) bars and every quote and trade. Disk-safe and fast.
 
+**Not tied to one folder.** The kit never assumes where data lives or how files are named. `scan` opens each capture
+and reads the packets themselves to learn the exchange, protocol and start time. So when the professor adds a new
+data folder, point `roots` at it (or leave `roots = auto`) and the same steps work. Files may be `.pcap.zst`,
+`.pcap.gz` or plain `.pcap`.
+
 Works on its own, and works even better with an AI agent (Claude Code, Gemini, Copilot, Codex): the agent asks
 you what you want, fills in `prefs.ini`, shows you the plan, and runs it. See
 [fin556-claude-vm-guide](https://github.com/vermasidd1502/fin556-claude-vm-guide) to set up an agent on the VM.
@@ -16,7 +21,7 @@ you what you want, fills in `prefs.ini`, shows you the plan, and runs it. See
 ## What it does
 | Step | Command | What happens |
 |---|---|---|
-| Find | `python3 kit.py scan` | C++ `pcap_scan` walks the data folders (read-only), opens the first few MB of each capture and writes `catalog.tsv`: venue, protocol (Nasdaq ITCH, CME MDP3, IEX-TP), date, first packet time, size, UDP ports. |
+| Find | `python3 kit.py scan` | C++ `pcap_scan` walks the data folders (read-only; `roots = auto` tries the usual ones), opens the first MB of each capture and writes `catalog.tsv`: venue, protocol (Nasdaq ITCH, CME MDP3, IEX-TP), date, first packet time, size, UDP ports. Every later step picks files from this catalog. |
 | Choose | `python3 kit.py ask` | A few questions → `prefs.ini`. Or edit the file, or let your agent fill it. |
 | Plan | `python3 kit.py plan` | Day by day: which files exist, which days are missing, a disk estimate against free space, and the exact commands. |
 | Pull | `python3 kit.py run` | C++ parsers through a job queue (max 32 threads). Temporary files are deleted after each day; it stops if the disk gets low. |
@@ -47,6 +52,8 @@ Needs `g++` and Python 3.9+ with `pandas` (in your own virtual environment). No 
 
 ## prefs.ini (the important lines)
 ```ini
+[data]
+roots = auto                              # or: /db_pcaps, /path/to/a/new/drop
 [request]
 venues = nasdaq, cme
 symbols = QQQ, TQQQ, SQQQ                 # or a file: symbols.txt

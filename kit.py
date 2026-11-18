@@ -1,19 +1,24 @@
 #!/usr/bin/env python3
-"""kit.py - pick the market data you want from the course captures, then pull it, fast and disk-safe.
+"""kit.py - find the market data captures on this machine, pick what you want, pull it. Fast and disk-safe.
 
-THIS IS HFT! NOT SHEEPLE CODING!!!  The heavy work is C++ (pcap_scan, itch_fast3, mdp3_fast3). This script only
-reads prefs.ini, plans, checks the disk, and runs the C++ tools through a job queue capped at 32 threads.
+THIS IS HFT! NOT SHEEPLE CODING!!!  The heavy work is C++ (pcap_scan, itch_fast3, mdp3_fast3). This script reads
+prefs.ini, plans, checks the disk, and runs the C++ tools through a job queue capped at 32 threads.
 
-  python3 kit.py scan            find every capture under [data] roots -> catalog.tsv + summary   (read-only)
-  python3 kit.py ask             answer a few questions -> prefs.ini   (or edit prefs.ini, or let the agent do it)
-  python3 kit.py plan            what would be pulled, which days are missing, disk estimate, exact commands
-  python3 kit.py run             pull it (asks before starting; --yes to skip the question)
-  python3 kit.py discover-cme --date YYYYMMDD   list busy CME SecurityIDs and prices (captures have no definitions)
-  python3 kit.py clean           delete this kit's temporary files (out_dir/raw, logs older runs keep)
+Nothing is tied to one folder layout. `scan` looks inside every capture it can find (read-only) and records the
+exchange, protocol and start time of each file in catalog.tsv; every later step picks files from that catalog.
+So new data the professor puts on the VM, in any folder, with any file names, works the same way.
+
+  python3 kit.py scan            find captures under [data] roots (auto = the usual data folders) -> catalog.tsv
+  python3 kit.py ask             answer a few questions -> prefs.ini   (or edit it, or let your AI agent fill it)
+  python3 kit.py plan            per day: files found, gaps, disk estimate, exact commands
+  python3 kit.py run             pull it (asks first; --yes to skip the question)
+  python3 kit.py discover-cme --date YYYYMMDD   busy CME SecurityIDs and their prices (no definitions in captures)
+  python3 kit.py clean           delete this kit's temporary files
 Options: --prefs FILE (default prefs.ini next to this script)
 """
 import argparse
 import configparser
+import csv
 import os
 import queue
 import re
@@ -22,21 +27,24 @@ import subprocess
 import sys
 import threading
 import time
-from datetime import date, datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone
 
 try:
     from zoneinfo import ZoneInfo
-except ImportError:  # python < 3.9
+except ImportError:
     sys.exit("needs python 3.9 or newer")
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ENGINE = os.path.join(HERE, "engine")
+CATALOG = os.path.join(HERE, "catalog.tsv")
 ET = ZoneInfo("America/New_York")
 NS = 1_000_000_000
-FN = re.compile(r"(\d{8})T(\d{6})")
 DAYS = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
-# rough output sizes measured on the course data (58 symbols, 18:00-20:00, 40 days): ticks ~0.04 MB per
-# symbol-hour (gzip), 1-min bars ~0.004 MB per symbol-hour. Used only for the disk estimate.
+# where course data usually lives on a lab machine; `roots = auto` scans the ones that exist (read-only)
+AUTO_ROOTS = ["/db_pcaps", "/md", "/data", "/datasets", "/shared", "/course", "/class", "/mnt", "/srv", "/scratch",
+              "/opt/data", "~/data", "~/pcaps"]
+VENUE_OF = {"nasdaq": "NASDAQ", "cme": "CME", "iex": "IEX"}
+# rough output sizes measured on the course data (58 symbols, 18:00-20:00, 40 days); disk estimate only
 MB_TICKS_PER_SYM_HOUR, MB_BARS_PER_SYM_HOUR = 0.04, 0.004
 
 
@@ -49,10 +57,7 @@ def load_prefs(path):
     g = lambda s, k, d="": cp.get(s, k, fallback=d).strip()
     lst = lambda s: [x.strip() for x in s.split(",") if x.strip()]
     p = {
-        "roots": lst(g("data", "roots", "/db_pcaps, /md/iex_pcaps")),
-        "xnas_root": g("data", "xnas_root", "/db_pcaps/xnas_pcaps"),
-        "glbx_root": g("data", "glbx_root", "/db_pcaps/glbx_pcaps"),
-        "iex_root": g("data", "iex_root", "/md/iex_pcaps"),
+        "roots": lst(g("data", "roots", "auto")),
         "venues": [v.lower() for v in lst(g("request", "venues", "nasdaq"))],
         "symbols": g("request", "symbols", "QQQ"),
         "cme": lst(g("request", "cme_instruments", "")),
@@ -61,9 +66,10 @@ def load_prefs(path):
         "weekdays": [d.lower()[:3] for d in lst(g("request", "weekdays", "mon,tue,wed,thu,fri"))],
         "skip": set(lst(g("request", "skip_dates", ""))),
         "start": g("request", "start", "09:30"), "end": g("request", "end", "16:00"),
+        "book_from": g("request", "book_from", "04:00"),
         "bars": [int(x) for x in lst(g("output", "bars", "1"))],
         "ticks": g("output", "ticks", "no").lower() in ("yes", "y", "true", "1"),
-        "out_dir": g("output", "out_dir", "out"),
+        "out_dir": os.path.expanduser(g("output", "out_dir", "out")),
         "max_threads": min(32, int(g("limits", "max_threads", "32") or 32)),
         "min_free_gb": float(g("limits", "min_free_gb", "5") or 5),
         "max_out_gb": float(g("limits", "max_out_gb", "10") or 10),
@@ -77,13 +83,23 @@ def load_prefs(path):
     for k in ("from", "to"):
         if not re.fullmatch(r"\d{8}", p[k]):
             sys.exit(f"prefs: [request] {k} must be YYYYMMDD (got '{p[k]}')")
-    for k in ("start", "end"):
+    for k in ("start", "end", "book_from"):
         if not re.fullmatch(r"\d{2}:\d{2}", p[k]):
             sys.exit(f"prefs: [request] {k} must be HH:MM New York time (got '{p[k]}')")
-    bad = set(p["venues"]) - {"nasdaq", "cme", "iex"}
+    bad = set(p["venues"]) - set(VENUE_OF)
     if bad:
         sys.exit(f"prefs: unknown venue(s) {sorted(bad)}; use nasdaq, cme, iex")
     return p
+
+
+def resolve_roots(p):
+    roots = []
+    for r in p["roots"]:
+        if r.lower() == "auto":
+            roots += [os.path.expanduser(x) for x in AUTO_ROOTS]
+        else:
+            roots.append(os.path.expanduser(r))
+    return [r for r in dict.fromkeys(roots) if os.path.isdir(r)]
 
 
 def days_of(p):
@@ -97,8 +113,7 @@ def days_of(p):
 
 def cme_for_day(p, day):
     """active CME instruments for a day: NAME=ID[@YYYYMMDD]; per root (name minus month+year) the newest start wins"""
-    best = {}
-    tag = day.strftime("%Y%m%d")
+    best, tag = {}, day.strftime("%Y%m%d")
     for item in p["cme"]:
         m = re.fullmatch(r"([A-Za-z0-9]+)=(\d+)(?:@(\d{8}))?", item.replace(" ", ""))
         if not m:
@@ -115,29 +130,85 @@ def et_ns(day, hhmm):
     return int(datetime(day.year, day.month, day.day, h, m, tzinfo=ET).timestamp()) * NS
 
 
-def select_files(root, day, t0, t1):
-    """10-minute capture files (named by UTC start) that overlap [t0, t1), oldest first (same rule as the engine)."""
-    out = []
-    for dd in (day - timedelta(days=1), day, day + timedelta(days=1)):
-        folder = os.path.join(root, dd.strftime("%Y%m%d"))
-        if not os.path.isdir(folder):
+# --------------------------------------------------------------------------- catalog: the only source of file paths
+def run_scan(p, peek=1, quiet=False):
+    exe = os.path.join(HERE, "pcap_scan")
+    if not os.access(exe, os.X_OK):
+        sys.exit("pcap_scan is not built - run: bash build.sh")
+    roots = resolve_roots(p)
+    if not roots:
+        sys.exit("no data folders found. Set [data] roots in prefs.ini to the folder(s) holding the captures.")
+    c = [exe, "--peek", str(peek), "--threads", str(p["max_threads"]), "--out", CATALOG] + roots
+    if not quiet:
+        print("scanning (read-only):", ", ".join(roots), flush=True)
+    rc = subprocess.call(c, stdout=subprocess.DEVNULL if quiet else None)
+    if rc:
+        sys.exit(f"pcap_scan failed (exit {rc})")
+    with open(CATALOG + ".roots", "w") as f:
+        f.write("\n".join(roots))
+
+
+def file_start_ns(row):
+    """start time of a capture file: first packet time if the scan opened it, else a YYYYMMDDTHHMMSS (UTC) name"""
+    fp = row.get("first_packet_utc", "-")
+    if fp and fp != "-":
+        s, frac = fp.rstrip("Z").split(".") if "." in fp else (fp.rstrip("Z"), "0")
+        t = datetime.strptime(s, "%Y-%m-%dT%H:%M:%S").replace(tzinfo=timezone.utc)
+        return int(t.timestamp()) * NS + int(frac.ljust(9, "0")[:9])
+    d, t = row.get("date", "-"), row.get("file_time", "-")
+    if d != "-" and t != "-":
+        return int(datetime.strptime(d + t, "%Y%m%d%H%M%S").replace(tzinfo=timezone.utc).timestamp()) * NS
+    if d != "-":  # a whole-day file named only by date: treat it as starting at New York midnight
+        dd = datetime.strptime(d, "%Y%m%d").date()
+        return et_ns(dd, "00:00")
+    return None
+
+
+def load_catalog(p):
+    roots = resolve_roots(p)
+    stale = not os.path.exists(CATALOG) or not os.path.exists(CATALOG + ".roots") or \
+        open(CATALOG + ".roots").read().split("\n") != roots
+    if stale:
+        print("catalog missing or made for other folders - scanning first", flush=True)
+        run_scan(p, peek=1, quiet=True)
+    with open(CATALOG) as f:
+        rows = list(csv.DictReader(f, delimiter="\t"))
+    groups = {}
+    for r in rows:
+        if r.get("protocol", "-") in ("-",):  # names-only scan: venue from the path is all we know
+            pass
+        s = file_start_ns(r)
+        if s is None:
             continue
-        for n in os.listdir(folder):
-            if not n.endswith(".pcap.zst"):
-                continue
-            m = FN.search(n)
-            if m:
-                s = int(datetime.strptime(m.group(1) + m.group(2), "%Y%m%d%H%M%S").replace(tzinfo=timezone.utc).timestamp()) * NS
-                if s + 600 * NS > t0 and s < t1:
-                    out.append((s, os.path.join(folder, n)))
-    return [f for _, f in sorted(out)]
+        r["start_ns"] = s
+        groups.setdefault((r["venue"], os.path.dirname(r["path"])), []).append(r)
+    # each file ends where the next file of the same feed starts; the last one gets the feed's usual length
+    by_venue = {}
+    for (venue, _), fs in groups.items():
+        fs.sort(key=lambda r: r["start_ns"])
+        gaps = sorted(b["start_ns"] - a["start_ns"] for a, b in zip(fs, fs[1:]) if b["start_ns"] > a["start_ns"])
+        typical = gaps[len(gaps) // 2] if gaps else 24 * 3600 * NS
+        for a, b in zip(fs, fs[1:] + [None]):  # a file never runs past the next one, nor much past the usual length
+            nxt = b["start_ns"] if b and b["start_ns"] > a["start_ns"] else None
+            a["end_ns"] = min(nxt, a["start_ns"] + typical) if nxt else a["start_ns"] + typical
+        by_venue.setdefault(venue, []).extend(fs)
+    # merge feeds split across folders (e.g. one folder per day) into one timeline per venue
+    for v in by_venue:
+        by_venue[v].sort(key=lambda r: r["start_ns"])
+    return by_venue
 
 
-def iex_files(root, day):
-    tag = day.strftime("%Y%m%d")
-    if not os.path.isdir(root):
-        return []
-    return sorted(os.path.join(dp, n) for dp, _, fs in os.walk(root) for n in fs if tag in n and "pcap" in n.lower())
+def ny_date(ns):
+    return datetime.fromtimestamp(ns / NS, tz=ET).strftime("%Y%m%d")
+
+
+def pick(cat, venue, t0, t1, day=None):
+    """capture files of a venue that overlap [t0, t1) in UTC epoch ns, oldest first.
+    Nasdaq ITCH times count from New York midnight with no date, so a Nasdaq file must also start on `day`."""
+    out = [r for r in cat.get(VENUE_OF[venue], []) if r["start_ns"] < t1 and r["end_ns"] > t0]
+    if venue == "nasdaq" and day is not None:
+        out = [r for r in out if ny_date(r["start_ns"]) == day.strftime("%Y%m%d")]
+    return [r["path"] for r in out]
 
 
 def free_gb(path):
@@ -165,20 +236,8 @@ def binary(name):
 
 # --------------------------------------------------------------------------- commands
 def cmd_scan(p, args):
-    exe = os.path.join(HERE, "pcap_scan")
-    if not os.access(exe, os.X_OK):
-        sys.exit("pcap_scan is not built - run: bash build.sh")
-    out = os.path.join(HERE, "catalog.tsv")
-    c = [exe, "--peek", str(args.peek), "--threads", str(min(32, p["max_threads"])), "--out", out]
-    if args.dates:
-        c += ["--from", p["from"], "--to", p["to"]]
-    roots = [r for r in p["roots"] if os.path.isdir(r)]
-    missing = [r for r in p["roots"] if not os.path.isdir(r)]
-    for r in missing:
-        print(f"note: {r} not found - skipped")
-    if not roots:
-        sys.exit("none of the [data] roots exist on this machine")
-    sys.exit(subprocess.call(c + roots))
+    run_scan(p, peek=args.peek)
+    print(f"catalog -> {CATALOG}")
 
 
 def ask(q, default):
@@ -195,6 +254,7 @@ def cmd_ask(p_path, args):
         if not cp.has_section(s):
             cp.add_section(s)
     g = lambda s, k, d: cp.get(s, k, fallback=d)
+    cp["data"]["roots"] = ask("Data folders to search (auto = the usual ones)", g("data", "roots", "auto"))
     cp["request"]["venues"] = ask("Venues (nasdaq, cme, iex)", g("request", "venues", "nasdaq, cme"))
     cp["request"]["symbols"] = ask("Nasdaq symbols (comma list or a file name)", g("request", "symbols", "QQQ, TQQQ, SQQQ"))
     cp["request"]["cme_instruments"] = ask("CME instruments NAME=SecurityID[@first_date]",
@@ -213,7 +273,7 @@ def cmd_ask(p_path, args):
     print(f"saved {p_path}. Next: python3 kit.py plan")
 
 
-def plan(p, quiet=False):
+def plan(p, cat, quiet=False):
     days = list(days_of(p))
     if not days:
         sys.exit("no days match from/to/weekdays/skip_dates")
@@ -222,23 +282,23 @@ def plan(p, quiet=False):
     rows, ok_days = [], []
     for d in days:
         t0, t1 = et_ns(d, p["start"]), et_ns(d, p["end"])
-        nx = len(select_files(p["xnas_root"], d, et_ns(d, "04:00"), t1)) if "nasdaq" in p["venues"] else None
-        cm_ids = cme_for_day(p, d) if "cme" in p["venues"] else ""
-        ng = len(select_files(p["glbx_root"], d, t0 - 30 * 60 * NS, t1)) if "cme" in p["venues"] else None
-        ni = len(iex_files(p["iex_root"], d)) if "iex" in p["venues"] else None
+        nx = len(pick(cat, "nasdaq", et_ns(d, p["book_from"]), t1, d)) if "nasdaq" in p["venues"] else None
+        ids = cme_for_day(p, d) if "cme" in p["venues"] else ""
+        ng = len(pick(cat, "cme", t0 - 30 * 60 * NS, t1)) if "cme" in p["venues"] else None
+        ni = len(pick(cat, "iex", t0, t1)) if "iex" in p["venues"] else None
         notes = []
         if nx == 0:
             notes.append("no Nasdaq files")
         if ng == 0:
             notes.append("no CME files")
-        if "cme" in p["venues"] and not cm_ids:
+        if "cme" in p["venues"] and not ids:
             notes.append("no CME instrument for this date")
         if ni is not None:
             notes.append(f"IEX: {ni} file(s), extraction not built yet" if ni else "no IEX files")
-        go = (nx is None or nx > 0) and (ng is None or (ng > 0 and cm_ids))
+        go = (nx is None or nx > 0) and (ng is None or (ng > 0 and ids)) and (nx is not None or ng is not None)
         if go:
             ok_days.append(d)
-        rows.append((d.strftime("%Y%m%d"), DAYS[d.weekday()], nx, ng, cm_ids or "-", "pull" if go else "skip", "; ".join(notes)))
+        rows.append((d.strftime("%Y%m%d"), DAYS[d.weekday()], nx, ng, ids or "-", "pull" if go else "skip", "; ".join(notes)))
     sym_hours = (nsym + (1 if "cme" in p["venues"] else 0)) * hours * len(ok_days)
     est_mb = sym_hours * ((MB_TICKS_PER_SYM_HOUR if p["ticks"] else 0) + MB_BARS_PER_SYM_HOUR * len(p["bars"]))
     fgb = free_gb(p["out_dir"])
@@ -255,11 +315,11 @@ def plan(p, quiet=False):
 
 
 def cmd_plan(p, args):
-    ok_days, _, _ = plan(p)
+    cat = load_catalog(p)
+    ok_days, _, _ = plan(p, cat)
     if ok_days:
-        d = ok_days[0]
         print("\nfirst day would run:")
-        for c in day_commands(p, d):
+        for c in day_commands(p, cat, ok_days[0], write_lists=False):
             if "--" in c:
                 k = c.index("--") + 1
                 files = c[k:]
@@ -267,20 +327,25 @@ def cmd_plan(p, args):
             print("  " + " ".join(c))
 
 
-def day_commands(p, day):
+def day_commands(p, cat, day, write_lists=True):
     tag = day.strftime("%Y%m%d")
     raw = os.path.join(p["out_dir"], "raw")
     cmds = []
     ids = cme_for_day(p, day) if "cme" in p["venues"] else ""
     if ids:
         cme = binary("mdp3_fast3") or binary("mdp3_fast2") or binary("mdp3_fast") or "mdp3_fast3(not built)"
-        files = select_files(p["glbx_root"], day, et_ns(day, p["start"]) - 30 * 60 * NS, et_ns(day, p["end"]))
+        files = pick(cat, "cme", et_ns(day, p["start"]) - 30 * 60 * NS, et_ns(day, p["end"]))
         cmds.append([sys.executable, os.path.join(ENGINE, "fast_feed.py"), cme, "--secids", ids, "--display-factor",
                      str(p["cme_factor"]), "--depth", "1", "--out", os.path.join(raw, f"glbx_{tag}"), "--"] + files)
     if "nasdaq" in p["venues"]:
+        lst = os.path.join(raw, f"xnas_files_{tag}.txt")
+        if write_lists:
+            os.makedirs(raw, exist_ok=True)
+            with open(lst, "w") as f:
+                f.write("\n".join(pick(cat, "nasdaq", et_ns(day, p["book_from"]), et_ns(day, p["end"]), day)))
         for i, b in enumerate(p["bars"] or [1]):
             c = [sys.executable, os.path.join(ENGINE, "make_bars.py"), "--date", tag, "--bar-min", str(b),
-                 "--start", p["start"], "--end", p["end"], "--symbols", p["symbols"], "--xnas-root", p["xnas_root"],
+                 "--start", p["start"], "--end", p["end"], "--symbols", p["symbols"], "--files", lst,
                  "--out-dir", p["out_dir"]]
             if p["ticks"] and i == 0:
                 c.append("--ticks")
@@ -315,7 +380,7 @@ def cme_only_outputs(p, day, log):
         print(f"  wrote {len(out):,} rows -> {path}", file=log)
     if p["ticks"]:
         q = pd.read_csv(base + "_bbo.csv", usecols=["ts_event_ns", "symbol", "bid_px_00", "bid_sz_00", "ask_px_00", "ask_sz_00"],
-                        dtype={"symbol": str}) if os.path.exists(base + "_bbo.csv") else pd.DataFrame()
+                        dtype={"symbol": str})
         t = pd.read_csv(base + "_trades.csv", dtype={"symbol": str, "aggressor": str})
         q = q[(q["ts_event_ns"] >= a0) & (q["ts_event_ns"] < a1)]
         t = t[(t["ts_event_ns"] >= a0) & (t["ts_event_ns"] < a1)]
@@ -336,7 +401,8 @@ def cme_only_outputs(p, day, log):
 
 
 def cmd_run(p, args):
-    ok_days, est_mb, fgb = plan(p)
+    cat = load_catalog(p)
+    ok_days, est_mb, fgb = plan(p, cat)
     if not ok_days:
         sys.exit("nothing to pull")
     if fgb - est_mb / 1e3 <= p["min_free_gb"]:
@@ -366,7 +432,7 @@ def cmd_run(p, args):
             log = os.path.join(p["out_dir"], "logs", f"kit_{tag}.log")
             rc = 0
             with open(log, "w") as lg:
-                for c in day_commands(p, d):
+                for c in day_commands(p, cat, d):
                     rc = subprocess.call(c, stdout=lg, stderr=subprocess.STDOUT, cwd=ENGINE)
                     if rc:
                         break
@@ -412,7 +478,8 @@ def cmd_discover(p, args):
     if not args.date:
         sys.exit("give --date YYYYMMDD")
     d = datetime.strptime(args.date, "%Y%m%d").date()
-    files = select_files(p["glbx_root"], d, et_ns(d, p["start"]), et_ns(d, p["start"]) + 20 * 60 * NS)[:2]
+    cat = load_catalog(p)
+    files = pick(cat, "cme", et_ns(d, p["start"]), et_ns(d, p["start"]) + 20 * 60 * NS)
     if not files:
         sys.exit("no CME files near the window start that day")
     c = [sys.executable, os.path.join(ENGINE, "mdp3_parse.py"), "--discover", "--max-packets", "3000000"] + args.rest + [files[0]]
@@ -422,20 +489,22 @@ def cmd_discover(p, args):
 
 def cmd_clean(p, args):
     raw = os.path.join(p["out_dir"], "raw")
+    gone = []
     if os.path.isdir(raw):
-        n = len(os.listdir(raw))
+        gone.append(f"{raw} ({len(os.listdir(raw))} file(s))")
         shutil.rmtree(raw)
-        print(f"cleaned: {raw} ({n} file(s))")
-    else:
-        print("cleaned: nothing to remove")
+    for f in (CATALOG, CATALOG + ".roots"):
+        if os.path.exists(f):
+            os.remove(f)
+            gone.append(os.path.basename(f))
+    print("cleaned: " + (", ".join(gone) if gone else "nothing to remove"))
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("command", choices=["scan", "ask", "plan", "run", "discover-cme", "clean"])
     ap.add_argument("--prefs", default=os.path.join(HERE, "prefs.ini"))
-    ap.add_argument("--peek", type=int, default=4, help="scan: MB to open per file (0 = names and sizes only)")
-    ap.add_argument("--dates", action="store_true", help="scan: only files inside prefs from/to")
+    ap.add_argument("--peek", type=int, default=4, help="scan: MB to open per file to identify it (0 = names only)")
     ap.add_argument("--date", help="discover-cme: day to look at")
     ap.add_argument("--yes", action="store_true", help="run: don't ask before starting")
     args, args.rest = ap.parse_known_args()

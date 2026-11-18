@@ -180,7 +180,10 @@ static void peek(Info& f, size_t want) {
         uint32_t sec = rd32(&buf[off]), frac = rd32(&buf[off + 4]), incl = rd32(&buf[off + 8]);
         if (incl > 262144 || off + 16 + incl > n) break;
         const uint8_t* pk = &buf[off + 16];
-        if (f.packets == 0) f.first_utc = utc_iso(sec, frac, nano);
+        if (f.packets == 0) {
+            f.first_utc = utc_iso(sec, frac, nano);
+            if (f.date == "-") f.date = f.first_utc.substr(0, 4) + f.first_utc.substr(5, 2) + f.first_utc.substr(8, 2);  // UTC date
+        }
         ++f.packets;
         size_t ip = 0;
         bool ok = false;
@@ -215,11 +218,10 @@ static void peek(Info& f, size_t want) {
     f.ports.clear();
     for (size_t i = 0; i < top.size() && i < 4; ++i) f.ports += (i ? "," : "") + std::to_string(top[i].second);
     if (f.ports.empty()) f.ports = "-";
-    if (f.venue == "unknown") {
-        if (f.proto == "NASDAQ-ITCH") f.venue = "NASDAQ";
-        else if (f.proto == "CME-MDP3") f.venue = "CME";
-        else if (f.proto.rfind("IEX", 0) == 0) f.venue = "IEX";
-    }
+    // what the packets say beats what the folder name says
+    if (f.proto == "NASDAQ-ITCH") f.venue = "NASDAQ";
+    else if (f.proto == "CME-MDP3") f.venue = "CME";
+    else if (f.proto.rfind("IEX", 0) == 0) f.venue = "IEX";
 }
 
 // ------------------------------------------------------------------ main: readers -> queue -> one writer

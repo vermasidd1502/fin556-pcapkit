@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """make_fake_pcaps.py - build a tiny fake capture tree (Nasdaq ITCH, CME MDP3, IEX-TP) to test pcap_scan.
 
-No real market data: every packet is made up. Usage:  python3 make_fake_pcaps.py <out_dir>
+No real market data: every packet is made up. Usage:  python3 make_fake_pcaps.py <out_dir> [--mixed]
 """
 import gzip
 import os
@@ -9,7 +9,7 @@ import struct
 import subprocess
 import sys
 
-out = sys.argv[1] if len(sys.argv) > 1 else "fake"
+out = next((a for a in sys.argv[1:] if not a.startswith("--")), "fake")
 
 
 def eth_ip_udp(payload, dport):
@@ -101,10 +101,19 @@ def write(path, data, comp):
 
 
 t0 = 1738623600 * 10**9  # 2025-02-03 23:00 UTC = 18:00 New York
-for day, t in (("20250203", t0), ("20250204", t0 + 86400 * 10**9)):
-    write(f"{out}/db_pcaps/xnas_pcaps/{day}/xnas-itch-{day}T230000.pcap.zst", pcap(itch_packets(600, t), t), "zst")
-    write(f"{out}/db_pcaps/glbx_pcaps/{day}/glbx-mdp3-{day}T230000.pcap.zst", pcap(cme_packets(500, t), t), "zst")
-    write(f"{out}/md/iex_pcaps/data_feeds_{day}_{day}_IEXTP1_DEEP1.0.pcap.gz", pcap(iex_packets(500, t), t, nano=False), "gz")
-write(f"{out}/db_pcaps/xnas_pcaps/20250205/xnas-itch-20250205T230000.pcap", pcap(itch_packets(50, t0), t0 + 2 * 86400 * 10**9), "none")
-write(f"{out}/db_pcaps/readme.txt", b"not a capture", "none")
+if "--mixed" in sys.argv:
+    # same packets, but the kind of layout a new drop might have: no date folders, names without dates,
+    # gzip and plain files mixed with zstd. pcapkit must find and order them from the packets alone.
+    for n, (day, t) in enumerate((("20250203", t0), ("20250204", t0 + 86400 * 10**9))):
+        write(f"{out}/new_drop/equities/feed_part{n}.pcap" + (".gz" if n == 0 else ""), pcap(itch_packets(600, t), t), "gz" if n == 0 else "none")
+        write(f"{out}/new_drop/futures/capture_{n:03d}.pcap.zst", pcap(cme_packets(500, t), t), "zst")
+        write(f"{out}/new_drop/misc/iex_{n}.pcap.gz", pcap(iex_packets(500, t), t, nano=False), "gz")
+    write(f"{out}/new_drop/notes.txt", b"not a capture", "none")
+else:
+    for day, t in (("20250203", t0), ("20250204", t0 + 86400 * 10**9)):
+        write(f"{out}/db_pcaps/xnas_pcaps/{day}/xnas-itch-{day}T230000.pcap.zst", pcap(itch_packets(600, t), t), "zst")
+        write(f"{out}/db_pcaps/glbx_pcaps/{day}/glbx-mdp3-{day}T230000.pcap.zst", pcap(cme_packets(500, t), t), "zst")
+        write(f"{out}/md/iex_pcaps/data_feeds_{day}_{day}_IEXTP1_DEEP1.0.pcap.gz", pcap(iex_packets(500, t), t, nano=False), "gz")
+    write(f"{out}/db_pcaps/xnas_pcaps/20250205/xnas-itch-20250205T230000.pcap", pcap(itch_packets(50, t0), t0 + 2 * 86400 * 10**9), "none")
+    write(f"{out}/db_pcaps/readme.txt", b"not a capture", "none")
 print("fake capture tree written to", out)

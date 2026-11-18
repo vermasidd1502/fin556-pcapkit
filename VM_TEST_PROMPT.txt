@@ -10,9 +10,11 @@ stop if free space would drop under 5 GB. Read-only on /db_pcaps and /md. Short 
    (reader-side filtering, trade_id in ticks, get_data.sh, check_export.py). Compare them. Where the VM version is
    newer, copy it into pcapkit/engine, rebuild, and run engine/bench_v3.sh on one real day to prove v1 and v3
    output are still byte-identical. List which files you replaced.
-3. Scan: python3 kit.py scan --peek 4 (all of /db_pcaps and /md/iex_pcaps). Show the summary table only:
-   venue, protocol, files, days, GB, date range. Say if any file came back not-pcap, unreadable or udp-unknown.
-4. Small real pull: set prefs.ini to venues = nasdaq, cme; symbols = QQQ, TQQQ, SQQQ;
+3. Scan with roots = auto: python3 kit.py scan. Show the summary table only: venue, protocol, files, days, GB,
+   date range. Say which folders it searched, and if any file came back not-pcap, unreadable or udp-unknown.
+   Then list any other read-only data folders on the VM that look like course data (e.g. under /md) that auto
+   missed, so we can add them to the auto list.
+4. Small real pull: set prefs.ini to roots = auto; venues = nasdaq, cme; symbols = QQQ, TQQQ, SQQQ;
    cme_instruments = NQH5=42288528, NQM5=42005804@20250317; from = 20250203; to = 20250204;
    weekdays = mon, tue, wed, thu; start = 18:00; end = 18:30; bars = 1; ticks = yes; out_dir = out_kittest.
    Run python3 kit.py plan, show it, then run it in the background and report each day.

@@ -7,11 +7,13 @@ You help the user pull market data from the course captures with this kit. The c
 data, no downloading data onto the VM, **never fill the shared disk**.
 
 ## How to run a request
-1. **Ask the user** (short questions, one message): which venues (Nasdaq, CME), which symbols or futures, which
+1. **Ask the user** (short questions, one message): where the data is if they know (else keep `roots = auto`), which venues (Nasdaq, CME), which symbols or futures, which
    dates, which time window (New York time), bar sizes, and whether they want every quote and trade.
    Suggest defaults from `prefs.ini`. Don't guess symbols or dates they didn't ask for.
 2. Write their answers into `prefs.ini`. Show them the lines you changed.
-3. Run `python3 kit.py scan --dates` (read-only) if `catalog.tsv` is missing or old, then `python3 kit.py plan`.
+3. Run `python3 kit.py scan` (read-only) and show the summary table: which exchanges, protocols, dates and sizes exist.
+   If the user's data isn't there, ask for the folder and set `roots`. Never guess paths outside the data folders.
+   Then `python3 kit.py plan`.
 4. Show the plan: days to pull, days missing and why, disk estimate, free space. **Wait for a yes.**
 5. Run `nohup python3 kit.py run --yes > kit_run.log 2>&1 &` and tell the user how to check on it
    (`tail -f kit_run.log`). Report each day's result in one line, not the logs.
