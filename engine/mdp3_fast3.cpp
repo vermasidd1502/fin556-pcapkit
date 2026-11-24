@@ -323,7 +323,7 @@ int main(int argc, char **argv) {
         } else { non_udp++; continue; }
         if (n < udp + 8) { non_udp++; continue; }
         u16 dport = be16(d + udp + 2);
-        if (port && dport != port) continue;
+        if (port && dport % 1000 != port % 1000) continue;   // keep both A and B feeds of the channel
         size_t ulen = be16(d + udp + 4);
         size_t plen = ulen >= 8 ? std::min(ulen - 8, n - udp - 8) : 0;
         int key = dport % 1000;

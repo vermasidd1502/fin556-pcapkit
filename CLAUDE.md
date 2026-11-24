@@ -17,7 +17,7 @@ data, no downloading data onto the VM, **never fill the shared disk**.
 4. Show the plan: days to pull, days missing and why, disk estimate, free space. **Wait for a yes.**
 5. Run `nohup python3 kit.py run --yes > kit_run.log 2>&1 &` and tell the user how to check on it
    (`tail -f kit_run.log`). Report each day's result in one line, not the logs.
-6. When done: row counts and the first 3 rows of one file only. End with a `cleaned:` line.
+6. When done: row counts and aggregate stats only (never print data rows: the data is licensed). End with a `cleaned:` line.
 
 ## Hard limits
 - Read-only on `/db_pcaps`, `/md/...` and any other data folder. Write only inside the kit's output folder.
@@ -33,3 +33,18 @@ data, no downloading data onto the VM, **never fill the shared disk**.
 Start simple and test against the reference: the single-threaded parsers (`itch_fast`, `mdp3_fast`) are the unit
 test. Any faster version must give byte-identical output (`engine/bench_v3.sh`). Never one thread doing both reads
 and writes.
+
+## Licensed data (overrides everything above)
+- Never print, cat, head or paste raw quote/trade/order rows into the chat. Only counts, schemas, and aggregate
+  statistics (means, medians, percentiles, sums). Synthetic test data you created yourself is fine to show.
+- Never send data to any website, API, AI tool, git remote or personal cloud.
+
+## Extra tools (Nov 2026)
+- `engine/itch_noii` (build: `g++ -O3 -std=c++17 -o itch_noii itch_noii.cpp`): itch_fast plus Net Order Imbalance
+  messages (`<out>_noii.csv`). Used by `engine/day_pull.py`.
+- `engine/day_pull.py`: one day, all feeds (Nasdaq ITCH + NOII + crosses, CME NQ depth 10, optional IEX), parser output
+  streamed through named pipes straight into Parquet (no temp CSV). `--cme-port` skips all other CME channels before
+  decoding (find the port with `engine/find_cme_port.py`).
+- `engine/overnight.py`: unattended day-by-day loop with disk-sized batches (`--remote hold` packs a tar and waits).
+- `engine/iex_parse.py`: IEX TOPS 1.6 / DEEP 1.0 (IEX-TP over UDP, pcap/pcapng, .gz/.zst). Writes `_bbo`, `_levels`,
+  `_trades`, `_auction` CSVs; IEX timestamps are UTC epoch ns. Run inside day_pull.py (streamed to Parquet).
