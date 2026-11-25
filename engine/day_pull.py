@@ -333,7 +333,7 @@ def main():
     ap.add_argument("--cme-port", type=int, default=0, help="UDP port of NQ's CME channel: skip all other channels before decoding")
     ap.add_argument("--iex-python", default="", help="interpreter for iex_parse.py, e.g. ~/pypy/bin/pypy3 (~10x faster)")
     ap.add_argument("--extra-secids", default="", help="more CME contracts on the same channel, e.g. MNQM5=123,ESM5=456 (label=SecurityID)")
-    ap.add_argument("--cme-threads", type=int, default=16)
+    ap.add_argument("--cme-threads", type=int, default=32)
     ap.add_argument("--nq-night", action="store_true", help="NQ only, 20:00 ET previous evening -> 04:00 ET (book built from 18:00)")
     ap.add_argument("--dry-run", action="store_true")
     a = ap.parse_args()

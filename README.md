@@ -91,14 +91,15 @@ disk safe. It is resumable: re-running the same command skips every finished day
 
 ```bash
 nohup python overnight.py --from 20250326 --to 20250417 \
-    --jobs 6 --cme-threads 16 --cme-port 14318 --extra-secids C111=111,C222=222 \
+    --jobs 8 --cme-threads 32 --cme-port 14318 --extra-secids C111=111,C222=222 \
     --iex-python ~/pypy/bin/pypy3 --iex-glob '/md/iex_pcaps/data_feeds_{date}_{date}_IEXTP1_DEEP1.0.pcap.gz' \
     --remote hold --batch-gb 100 --min-free-gb 1 --work ~/myproject/overnight >> ~/myproject/overnight.log 2>&1 &
 ```
 
 | Option | Meaning |
 |---|---|
-| `--jobs N` | days parsed at the same time (capped by free disk, `--day-gb` reserved per day) |
+| `--jobs N` | days parsed at the same time (default 8; capped by free disk, `--day-gb` = 1.0 GB reserved per day) |
+| `--cme-threads` | threads per CME parser (default 32: 8 readers/decompressors + 12 book shards) |
 | `--remote hold` | when staging fills, pack it into `ready/batch_NN.tar` and wait until it has been copied off and deleted |
 | `--remote <rclone remote>` | alternatively upload each batch with rclone and verify it |
 | `--batch-gb` | batch size; with a large value, batches are sized by free disk instead |
