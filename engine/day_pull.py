@@ -27,6 +27,7 @@ import pyarrow as pa, pyarrow.compute as pc, pyarrow.csv as pacsv, pyarrow.parqu
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
+from datetime import timedelta
 from ndx_combine import NS, daterange, et_ns, select_files  # noqa: E402
 
 STOCKS = "NVDA,TSLA,AAPL,AMD,AMZN,AVGO,COIN,GOOGL,META,MSFT,MSTR,PLTR"
@@ -159,6 +160,58 @@ def bwin(b, col, t0, t1, shift_from=None, base=0):
     return in_win(t, col, t0, t1).combine_chunks()
 
 
+def do_nq_night(day, a, raw):
+    """NQ only, overnight: 20:00 ET the previous evening -> 04:00 ET on `day`. The CME session opens at 18:00 ET, so
+    files are read from 18:00 (book built from the session start) but only 20:00-04:00 is written.
+    Output: nq_night_<day>.parquet (L1 quotes + trades, same columns as ticks) and nq_night_depth_<day>.parquet."""
+    tag = day.strftime("%Y%m%d"); prev = day - timedelta(days=1)
+    w0, t0, t1 = et_ns(prev, "18:00"), et_ns(prev, "20:00"), et_ns(day, "04:00")
+    cme = select_files(a.glbx_root, day, w0, t1)
+    print(f"{tag}: night glbx {len(cme)} files {sum(map(os.path.getsize, cme))/1e9:.1f} GB, NQ {nq_for(tag)}", flush=True)
+    if a.dry_run:
+        return None
+    if not cme:
+        print(f"INCOMPLETE {tag} | glbx-night | missing files", flush=True)
+        return None
+    gb = os.path.join(raw, f"glbx_{tag}")
+    out = lambda n: os.path.join(a.out_dir, f"{n}_{tag}.parquet")
+    log = os.path.join(a.out_dir, f"log_{tag}.txt")
+    cme_bin = next(os.path.join(HERE, b) for b in ("mdp3_fast3", "mdp3_fast2", "mdp3_fast") if os.access(os.path.join(HERE, b), os.X_OK))
+    depth_w = StreamParquet(out("nq_night_depth"))
+
+    def cme_bbo(b):
+        t = bwin(b, "ts_event_ns", t0, t1)
+        if t.num_rows:
+            depth_w.add(t.select(["ts_recv_ns", "ts_event_ns", "flags"] + [c for c in t.column_names if c[-2:].isdigit() and c[-2:] != "00"]).to_batches()[0])
+            t = t.select(["ts_recv_ns", "ts_event_ns", "symbol", "bid_px_00", "bid_sz_00", "ask_px_00", "ask_sz_00"]) \
+                 .rename_columns(["ts_recv_ns", "ts_event_ns", "symbol", "bid_px", "bid_sz", "ask_px", "ask_sz"])
+        return t.to_batches()[0] if t.num_rows else None
+
+    sinks = {"gq": Sink(gb + "_bbo.csv", cme_bbo),
+             "gt": Sink(gb + "_trades.csv", lambda b: (lambda t: t.to_batches()[0] if t.num_rows else None)(bwin(b, "ts_event_ns", t0, t1)))}
+    lf = open(log, "a")
+    p = subprocess.Popen([sys.executable, os.path.join(HERE, "fast_feed.py"), cme_bin, "--secids", ",".join([nq_for(tag)] + ([a.extra_secids] if a.extra_secids else [])), "--display-factor", "0.01",
+                          "--depth", str(DEPTH), "--out", gb] + (["--port", str(a.cme_port)] if a.cme_port else []) + ["--"] + cme,
+                         stdout=lf, stderr=subprocess.STDOUT)
+    while p.poll() is None:
+        if free_gb(a.out_dir) < a.min_free_gb:
+            p.kill(); raise SystemExit(f"{tag}: free disk below {a.min_free_gb} GB - stopped")
+        time.sleep(5)
+    T = {k: s.finish() for k, s in sinks.items()}
+    depth_w.close()
+    if p.returncode or T["gq"] is None:
+        print(f"INCOMPLETE {tag} | glbx-night | {'parser exit ' + str(p.returncode) if p.returncode else 'no rows'} (see {log})", flush=True)
+        return None
+    parts = [conform(T["gq"], {"venue": "GLBX", "type": "Q"})]
+    if T["gt"] is not None:
+        parts.append(conform(T["gt"].rename_columns(["trade_id" if c == "rpt_seq" else c for c in T["gt"].column_names]), {"venue": "GLBX", "type": "T"}))
+    nt = pa.concat_tables(parts); nt = nt.take(pc.sort_indices(nt, [("ts_event_ns", "ascending")]))
+    write(nt, out("nq_night"))
+    print(f"{tag}: night NQ quotes {T['gq'].num_rows}, trades {0 if T['gt'] is None else T['gt'].num_rows}; "
+          f"{(os.path.getsize(out('nq_night')) + os.path.getsize(out('nq_night_depth'))) / 1e6:.0f} MB", flush=True)
+    return 1
+
+
 def do_day(day, a, raw):
     tag = day.strftime("%Y%m%d")
     t0, t1, mid = et_ns(day, a.start), et_ns(day, a.end), et_ns(day, "00:00")
@@ -205,7 +258,7 @@ def do_day(day, a, raw):
                       "il": Sink(ib + "_levels.csv", lambda b: lev_w.add(b))})
     lf = open(log, "a")
     procs = {"xnas": subprocess.Popen([sys.executable, feed, os.path.join(HERE, "itch_noii"), "--symbols", SYMS, "--out", xb, "--"] + itch, stdout=lf, stderr=subprocess.STDOUT),
-             "glbx": subprocess.Popen([sys.executable, feed, cme_bin, "--secids", nq_for(tag), "--display-factor", "0.01", "--depth", str(DEPTH),
+             "glbx": subprocess.Popen([sys.executable, feed, cme_bin, "--secids", ",".join([nq_for(tag)] + ([a.extra_secids] if a.extra_secids else [])), "--display-factor", "0.01", "--depth", str(DEPTH), "--threads", str(a.cme_threads),
                                        "--out", gb] + (["--port", str(a.cme_port)] if a.cme_port else []) + ["--"] + cme, stdout=lf, stderr=subprocess.STDOUT)}
     if iex:
         procs["iex"] = subprocess.Popen([sys.executable, os.path.join(HERE, "iex_parse.py"), "--symbols", SYMS, "--out", ib,
@@ -274,9 +327,12 @@ def main():
     ap.add_argument("--out-dir", default=os.path.expanduser("~/myproject/pull_out"))
     ap.add_argument("--min-free-gb", type=float, default=5.0)
     ap.add_argument("--cme-port", type=int, default=0, help="UDP port of NQ's CME channel: skip all other channels before decoding")
+    ap.add_argument("--extra-secids", default="", help="more CME contracts on the same channel, e.g. MNQM5=123,ESM5=456 (label=SecurityID)")
+    ap.add_argument("--cme-threads", type=int, default=16)
+    ap.add_argument("--nq-night", action="store_true", help="NQ only, 20:00 ET previous evening -> 04:00 ET (book built from 18:00)")
     ap.add_argument("--dry-run", action="store_true")
     a = ap.parse_args()
-    if not a.dry_run and not os.access(os.path.join(HERE, "itch_noii"), os.X_OK):
+    if not a.dry_run and not a.nq_night and not os.access(os.path.join(HERE, "itch_noii"), os.X_OK):
         raise SystemExit("build first: g++ -O3 -std=c++17 -o itch_noii itch_noii.cpp")
     os.makedirs(a.out_dir, exist_ok=True)
     raw = os.path.join(a.out_dir, "raw"); os.makedirs(raw, exist_ok=True)
@@ -289,7 +345,7 @@ def main():
         if free_gb(a.out_dir) < a.min_free_gb:
             raise SystemExit(f"free disk below {a.min_free_gb} GB - stopped before {day:%Y%m%d}")
         try:
-            ok += bool(do_day(day, a, raw))
+            ok += bool((do_nq_night if a.nq_night else do_day)(day, a, raw))
         except Exception as e:                       # keep going; report the day as incomplete
             print(f"INCOMPLETE {day:%Y%m%d} | all | {type(e).__name__}: {e}", flush=True)
     shutil.rmtree(raw, ignore_errors=True)

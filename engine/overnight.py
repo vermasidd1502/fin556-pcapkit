@@ -74,6 +74,11 @@ def main():
     ap.add_argument("--batch-gb", type=float, default=7.5)
     ap.add_argument("--min-free-gb", type=float, default=5.0)
     ap.add_argument("--cme-port", type=int, default=0)
+    ap.add_argument("--jobs", type=int, default=6, help="days parsed in parallel")
+    ap.add_argument("--day-gb", type=float, default=1.5, help="disk room reserved per parallel day")
+    ap.add_argument("--cme-threads", type=int, default=16)
+    ap.add_argument("--extra-secids", default="")
+    ap.add_argument("--nq-night", action="store_true", help="NQ-only overnight pass (20:00 prev -> 04:00); use its own --work/--state")
     ap.add_argument("--rclone", default=os.path.expanduser("~/bin/rclone"))
     ap.add_argument("--retries", type=int, default=5)
     ap.add_argument("--puller", default=os.path.join(HERE, "day_pull.py"), help=argparse.SUPPRESS)
@@ -83,7 +88,8 @@ def main():
     stage = os.path.join(a.work, "stage"); os.makedirs(stage, exist_ok=True)
     done = {l.strip() for l in open(a.state) if l.strip() and not l.startswith("batch ")} if os.path.exists(a.state) else set()
     # a day counts as staged only if its ticks file exists (written last); remove leftovers of half-finished days
-    staged = sorted({f[6:14] for f in os.listdir(stage) if f.startswith("ticks_") and f.endswith(".parquet")})
+    key = "nq_night_" if a.nq_night else "ticks_"
+    staged = sorted({f[len(key):len(key) + 8] for f in os.listdir(stage) if f.startswith(key) and f[len(key):len(key) + 8].isdigit()})
     for f in os.listdir(stage):
         p = os.path.join(stage, f)
         if os.path.isfile(p) and not any(d in f for d in staged):
@@ -111,35 +117,48 @@ def main():
         log(f"UPLOADED batch_{n:02d}: {len(days)} days {days[0]}..{days[-1]}, {gb:.2f} GB; free {free_gb(a.work):.1f} GB")
         n += 1; staged = []
 
-    for i, d in enumerate(todo):
-        if free_gb(a.work) < a.min_free_gb + 2:
+    done_n, J = 0, max(1, a.jobs)
+    while done_n < len(todo):
+        # each parallel day needs ~day_gb of room; ship what's staged first if the disk can't hold a full group
+        if free_gb(a.work) < a.min_free_gb + 2 + a.day_gb * J:
             flush(final=True)
-        if free_gb(a.work) < a.min_free_gb + 2:
-            log(f"STOP: free disk {free_gb(a.work):.1f} GB too low before {d}"); sys.exit(3)
-        t = time.time()
-        cmd = [sys.executable, a.puller, "--from", d, "--to", d, "--out-dir", stage, "--min-free-gb", str(a.min_free_gb)]
-        if a.iex_glob:
-            cmd += ["--iex-glob", a.iex_glob]
-        if a.cme_port:
-            cmd += ["--cme-port", str(a.cme_port)]
-        r = subprocess.run(cmd, capture_output=True, text=True)
-        for line in r.stdout.splitlines():
-            if line.startswith(("INCOMPLETE", "free disk below")):
-                log(line)
+        room = int((free_gb(a.work) - a.min_free_gb - 2) // a.day_gb)
+        k = min(J, max(room, 0), len(todo) - done_n)
+        if k < 1:
+            log(f"STOP: free disk {free_gb(a.work):.1f} GB too low before {todo[done_n]}"); sys.exit(3)
+        group = todo[done_n:done_n + k]
+        t = time.time(); procs = {}
+        for d in group:
+            cmd = [sys.executable, a.puller, "--from", d, "--to", d, "--out-dir", stage, "--min-free-gb", str(a.min_free_gb),
+                   "--cme-threads", str(a.cme_threads)]
+            if a.iex_glob:
+                cmd += ["--iex-glob", a.iex_glob]
+            if a.cme_port:
+                cmd += ["--cme-port", str(a.cme_port)]
+            if a.extra_secids:
+                cmd += ["--extra-secids", a.extra_secids]
+            if a.nq_night:
+                cmd += ["--nq-night"]
+            procs[d] = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        outs = {d: p.communicate() for d, p in procs.items()}
         for f in os.listdir(stage):                     # parser logs are not data we keep
             if f.startswith("log_"):
                 os.remove(os.path.join(stage, f))
-        got = os.path.exists(os.path.join(stage, f"ticks_{d}.parquet"))
-        if not got:                                     # drop partial files of a failed day
-            for f in os.listdir(stage):
-                if d in f and os.path.isfile(os.path.join(stage, f)):
-                    os.remove(os.path.join(stage, f))
-        log(f"{d}: {'ok' if got else 'NO OUTPUT'} in {time.time()-t:.0f}s; stage {du_gb(stage):.2f} GB ({i+1}/{len(todo)})")
-        if not got:
-            with open(a.state, "a") as fh:
-                fh.write(d + "\n")                       # holiday / missing feed: don't retry every run
-            if "INCOMPLETE" not in r.stdout:
-                log(f"INCOMPLETE {d} | all | no output (exit {r.returncode}) {r.stderr.strip()[-200:]}")
+        for d in group:
+            so, se = outs[d]; done_n += 1
+            for line in so.splitlines():
+                if line.startswith(("INCOMPLETE", "free disk below")):
+                    log(line)
+            got = os.path.exists(os.path.join(stage, f"{'nq_night' if a.nq_night else 'ticks'}_{d}.parquet"))
+            if not got:                                 # drop partial files of a failed day
+                for f in os.listdir(stage):
+                    if d in f and os.path.isfile(os.path.join(stage, f)):
+                        os.remove(os.path.join(stage, f))
+                with open(a.state, "a") as fh:
+                    fh.write(d + "\n")                   # holiday / missing feed: don't retry every run
+                if "INCOMPLETE" not in so:
+                    log(f"INCOMPLETE {d} | all | no output (exit {procs[d].returncode}) {se.strip()[-200:]}")
+            log(f"{d}: {'ok' if got else 'NO OUTPUT'} in {time.time()-t:.0f}s ({k} days in parallel); stage {du_gb(stage):.2f} GB ({done_n}/{len(todo)})")
         flush()
     flush(final=True)
     shutil.rmtree(stage, ignore_errors=True)
