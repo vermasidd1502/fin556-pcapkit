@@ -91,7 +91,7 @@ disk safe. It is resumable: re-running the same command skips every finished day
 
 ```bash
 nohup python overnight.py --from 20250326 --to 20250417 \
-    --jobs 8 --cme-threads 32 --cme-port 14318 --extra-secids C111=111,C222=222 \
+    --jobs 8 --cme-threads 32 --cme-port 14318 --center 20250402 --extra-secids C111=111,C222=222 \
     --iex-python ~/pypy/bin/pypy3 --iex-glob '/md/iex_pcaps/data_feeds_{date}_{date}_IEXTP1_DEEP1.0.pcap.gz' \
     --remote hold --batch-gb 100 --min-free-gb 1 --work ~/myproject/overnight >> ~/myproject/overnight.log 2>&1 &
 ```
@@ -104,6 +104,7 @@ nohup python overnight.py --from 20250326 --to 20250417 \
 | `--remote <rclone remote>` | alternatively upload each batch with rclone and verify it |
 | `--batch-gb` | batch size; with a large value, batches are sized by free disk instead |
 | `--min-free-gb` | hard floor: parsers are stopped if free space drops below it |
+| `--center` | pull outward from this day (default 20250402: tariff date, +1, -1, +2, -2 ...) |
 | `--nq-night` | NQ-only overnight pass (20:00 ET previous evening to 04:00 ET; book built from the 18:00 session open) |
 
 Progress lines only (no data): `grep -E 'start:|ok in|READY|INCOMPLETE|STOP|ALL DONE' ~/myproject/overnight.log`

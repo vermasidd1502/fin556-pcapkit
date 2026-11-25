@@ -224,9 +224,11 @@ def do_day(day, a, raw):
           f"{sum(map(os.path.getsize, iex))/1e9:.1f} GB, NQ {nq_for(tag)}", flush=True)
     if a.dry_run:
         return None
-    if not itch or not cme:
-        print(f"INCOMPLETE {tag} | {'xnas' if not itch else 'glbx'} | missing files", flush=True)
+    if not itch:
+        print(f"INCOMPLETE {tag} | xnas | missing files", flush=True)
         return None
+    if not cme:                                      # still keep Nasdaq + IEX for the day (e.g. CME gap on the VM)
+        print(f"INCOMPLETE {tag} | glbx | missing files (Nasdaq/IEX kept)", flush=True)
     xb, gb, ib = (os.path.join(raw, f"{v}_{tag}") for v in ("xnas", "glbx", "iex"))
     out = lambda n: os.path.join(a.out_dir, f"{n}_{tag}.parquet")
     log = os.path.join(a.out_dir, f"log_{tag}.txt")
@@ -253,15 +255,18 @@ def do_day(day, a, raw):
         return t.to_batches()[0] if t.num_rows else None
 
     sinks = {"xq": Sink(xb + "_bbo.csv", xw), "xt": Sink(xb + "_trades.csv", xtr), "xn": Sink(xb + "_noii.csv", xw),
-             "xm": Sink(xb + "_mpid.csv", xw),
-             "gq": Sink(gb + "_bbo.csv", cme_bbo), "gt": Sink(gb + "_trades.csv", lambda b: (lambda t: t.to_batches()[0] if t.num_rows else None)(bwin(b, "ts_event_ns", t0, t1)))}
+             "xm": Sink(xb + "_mpid.csv", xw)}
+    if cme:
+        sinks.update({"gq": Sink(gb + "_bbo.csv", cme_bbo),
+                      "gt": Sink(gb + "_trades.csv", lambda b: (lambda t: t.to_batches()[0] if t.num_rows else None)(bwin(b, "ts_event_ns", t0, t1)))})
     if iex:
         sinks.update({"iq": Sink(ib + "_bbo.csv"), "it": Sink(ib + "_trades.csv"), "ia": Sink(ib + "_auction.csv"),
                       "il": Sink(ib + "_levels.csv", lambda b: lev_w.add(b))})
     lf = open(log, "a")
-    procs = {"xnas": subprocess.Popen([sys.executable, feed, os.path.join(HERE, "itch_noii"), "--symbols", SYMS, "--out", xb, "--"] + itch, stdout=lf, stderr=subprocess.STDOUT),
-             "glbx": subprocess.Popen([sys.executable, feed, cme_bin, "--secids", ",".join([nq_for(tag)] + ([a.extra_secids] if a.extra_secids else [])), "--display-factor", "0.01", "--depth", str(DEPTH), "--threads", str(a.cme_threads),
-                                       "--out", gb] + (["--port", str(a.cme_port)] if a.cme_port else []) + ["--"] + cme, stdout=lf, stderr=subprocess.STDOUT)}
+    procs = {"xnas": subprocess.Popen([sys.executable, feed, os.path.join(HERE, "itch_noii"), "--symbols", SYMS, "--out", xb, "--"] + itch, stdout=lf, stderr=subprocess.STDOUT)}
+    if cme:
+        procs["glbx"] = subprocess.Popen([sys.executable, feed, cme_bin, "--secids", ",".join([nq_for(tag)] + ([a.extra_secids] if a.extra_secids else [])), "--display-factor", "0.01", "--depth", str(DEPTH), "--threads", str(a.cme_threads),
+                                       "--out", gb] + (["--port", str(a.cme_port)] if a.cme_port else []) + ["--"] + cme, stdout=lf, stderr=subprocess.STDOUT)
     if iex:
         procs["iex"] = subprocess.Popen([a.iex_python or sys.executable, os.path.join(HERE, "iex_parse.py"), "--symbols", SYMS, "--out", ib,
                                          "--start-ns", str(t0), "--end-ns", str(t1)] + iex, stdout=lf, stderr=subprocess.STDOUT)
@@ -269,20 +274,21 @@ def do_day(day, a, raw):
         if free_gb(a.out_dir) < a.min_free_gb:
             for p in procs.values(): p.kill()
             raise SystemExit(f"{tag}: free disk below {a.min_free_gb} GB - stopped")
-        time.sleep(5)
+        time.sleep(15)                               # one cheap free-space check per 15 s
     T = {k: s.finish() for k, s in sinks.items()}
     depth_w.close(); lev_w.close()
     bad = [k for k, p in procs.items() if p.returncode]
     for k in bad:
         print(f"INCOMPLETE {tag} | {k} | parser exit {procs[k].returncode} (see {log})", flush=True)
-    if "xnas" in bad or "glbx" in bad or T["xq"] is None or T["gq"] is None:
+    if "xnas" in bad or "glbx" in bad or T["xq"] is None or (cme and T["gq"] is None):
         if not bad:
             print(f"INCOMPLETE {tag} | xnas/glbx | no rows parsed (see {log})", flush=True)
         return None
 
     parts = [conform(T["xq"], {"venue": "XNAS", "type": "Q"})]
-    t = T["xt"]
-    isq = pc.equal(t["kind"], "Q")
+    t = T["xt"] if T["xt"] is not None else pa.table({c: pa.array([], CONV.column_types[c]) for c in
+        ["ts_recv_ns", "ts_event_ns", "symbol", "price", "size", "kind", "aggressor", "match_no", "cross_type"]})
+    isq = pc.fill_null(pc.equal(t["kind"], "Q"), False)
     cr = t.filter(isq)
     t = t.filter(pc.invert(isq)).rename_columns(["trade_id" if c == "match_no" else c for c in t.column_names])
     parts.append(conform(t, {"venue": "XNAS", "type": "T"}))
@@ -291,8 +297,9 @@ def do_day(day, a, raw):
     write(n, out("noii"))
     if T["xm"] is not None:
         write(T["xm"], out("mpid"))                  # attributed adds: which firm posted which order
-    parts.append(conform(T["gq"], {"venue": "GLBX", "type": "Q"}))
-    if T["gt"] is not None:
+    if cme:
+        parts.append(conform(T["gq"], {"venue": "GLBX", "type": "Q"}))
+    if cme and T["gt"] is not None:
         parts.append(conform(T["gt"].rename_columns(["trade_id" if c == "rpt_seq" else c for c in T["gt"].column_names]), {"venue": "GLBX", "type": "T"}))
     if iex and "iex" not in bad:
         if T["iq"] is not None:
@@ -311,7 +318,8 @@ def do_day(day, a, raw):
     hidden = int(pc.sum(pc.equal(t["kind"], "P")).as_py() or 0)
     ccs = set(cr.filter(pc.equal(cr["cross_type"], "C"))["symbol"].to_pylist())
     miss = [s for s in STOCKS.split(",") + INDEX.split(",") if s not in ccs]
-    mb = sum(os.path.getsize(out(x)) for x in ("ticks", "cme_depth", "noii", "crosses")) / 1e6
+    mb = sum(os.path.getsize(out(x)) for x in ("ticks", "cme_depth", "noii", "crosses", "mpid", "iex_levels", "iex_auction")
+             if os.path.exists(out(x))) / 1e6
     print(f"{tag}: {cnt}; hidden execs {hidden}; noii {n.num_rows}; cross prints {cr.num_rows}; "
           f"closing cross {len(ccs)} syms; {mb:.0f} MB", flush=True)
     if miss:

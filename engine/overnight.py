@@ -1,170 +1,256 @@
 #!/usr/bin/env python3
-"""overnight.py - unattended loop on the lab VM: parse a day -> when the staging folder reaches --batch-gb,
-upload it to cloud storage with rclone -> verify -> delete -> continue. Resumable: re-run the same command and
-finished days are skipped (state in --state). No AI agent needed while it runs. Prints counts/sizes only.
+"""overnight.py - unattended multi-day pull on the FIN556 lab VM (team 8 defaults built in).
 
-  nohup ~/letf_env/bin/python overnight.py --remote univ_onedrive:FIN556/team8_pull \
-      --iex-glob '/md/iex_pcaps/data_feeds_{date}_{date}_IEXTP1_DEEP1.0.pcap.gz' > ~/myproject/overnight.log 2>&1 &
-  grep -E 'UPLOADED|INCOMPLETE|STOP|ALL DONE' ~/myproject/overnight.log      # check in the morning
+Parses trading days with day_pull.py, several at once, into a staging folder. When staging is full (or the disk is
+near the floor) it packs everything into ONE file, <work>/ready/batch_NN.tar, and waits until that file has been
+downloaded and deleted, then continues. Resumable: re-running the same command skips finished days.
+
+Typical use (all defaults are the team-8 settings; override any flag on the command line):
+  nohup ~/letf_env/bin/python overnight.py >> ~/myproject/overnight.log 2>&1 &
+  grep -E 'start:|ok |READY|SHIPPED|INCOMPLETE|WAIT|STOP|ALL DONE' ~/myproject/overnight.log | tail
+
+Day order: --center 20250402 pulls the tariff date first, then +1, -1, +2, -2 ... trading days.
+State file: finished days, permanently skipped days (no data on the VM) and batch records. Days whose parser failed
+are NOT recorded, so the next run retries them.
+Prints counts, sizes and timings only - never data rows.
 """
-import argparse, os, shutil, subprocess, sys, time
+import argparse
+import os
+import shutil
+import subprocess
+import sys
+import tarfile
+import time
 from datetime import datetime, timedelta
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+HOME = os.path.expanduser("~")
+
+# ----------------------------------------------------------------------------- team-8 defaults (one place)
+DEFAULTS = dict(
+    d0="20250203", d1="20250430", center="20250402",
+    work=f"{HOME}/myproject/overnight", state=f"{HOME}/myproject/overnight_done.txt",
+    remote="hold", batch_gb=100.0, min_free_gb=1.0, day_gb=1.0,
+    jobs=8, cme_threads=32, cme_port=14318,
+    iex_glob="/md/iex_pcaps/data_feeds_{date}_{date}_IEXTP1_DEEP1.0.pcap.gz",
+    iex_python=f"{HOME}/pypy/bin/pypy3",                    # used only if it exists
+    secids_file=f"{HOME}/myproject/cme_secids.txt",         # one LABEL=SecurityID per line (extra CME contracts)
+    rclone=f"{HOME}/bin/rclone", retries=5,
+    wait_poll_s=60, wait_note_s=1800,                       # hold/low-disk waits: check every minute, note every 30 min
+)
+SKIP_MARK = "skip "                                         # state-file prefix for days with no data on the VM
 
 
 def log(msg):
     print(f"{datetime.now():%m-%d %H:%M:%S} {msg}", flush=True)
 
 
-def du_gb(p):
-    return sum(os.path.getsize(os.path.join(r, f)) for r, _, fs in os.walk(p) for f in fs) / 1e9
+def free_gb(path):
+    return shutil.disk_usage(path).free / 1e9
 
 
-def free_gb(p):
-    return shutil.disk_usage(p).free / 1e9
+def du_gb(path):
+    return sum(os.path.getsize(os.path.join(r, f)) for r, _, fs in os.walk(path) for f in fs) / 1e9
 
 
-def weekdays(a, b):
-    d, z = datetime.strptime(a, "%Y%m%d"), datetime.strptime(b, "%Y%m%d")
+def weekdays(d0, d1):
+    d, z = datetime.strptime(d0, "%Y%m%d"), datetime.strptime(d1, "%Y%m%d")
+    out = []
     while d <= z:
         if d.weekday() < 5:
-            yield d.strftime("%Y%m%d")
+            out.append(d.strftime("%Y%m%d"))
         d += timedelta(days=1)
+    return out
 
 
-def upload(a, stage, n):
-    """rclone copy + one-way check, with retries; True only if every file is verified remote.
-    --remote hold: move the batch to <work>/ready/batch_NN and wait until something else (the Mac's
-    pull_batches.sh) has copied it away and deleted that folder."""
+def center_out(days, center):
+    """center, +1, -1, +2, -2 ... in trading-day steps (ties: later day first)."""
+    if not center or not days:
+        return list(days)
+    c = min(range(len(days)), key=lambda i: abs(int(days[i]) - int(center)))
+    return sorted(days, key=lambda d: (abs(days.index(d) - c), days.index(d) < c))
+
+
+# ----------------------------------------------------------------------------- state file
+class State:
+    """Plain-text, append-only: '<day>' = finished, 'skip <day> <reason>' = no data, 'batch N <days...>'."""
+
+    def __init__(self, path):
+        self.path, self.done, self.skipped, self.last_batch = path, set(), set(), 0
+        if os.path.exists(path):
+            for line in open(path):
+                w = line.split()
+                if not w:
+                    continue
+                if w[0] == "batch":
+                    self.last_batch = max(self.last_batch, int(w[1]))
+                elif w[0] == "skip":
+                    self.skipped.add(w[1])
+                else:
+                    self.done.add(w[0])
+
+    def _append(self, text):
+        with open(self.path, "a") as fh:
+            fh.write(text)
+
+    def mark_batch(self, n, days):
+        self._append(f"batch {n} {' '.join(days)}\n" + "".join(f"{d}\n" for d in days))
+        self.done.update(days); self.last_batch = n
+
+    def mark_skip(self, day, reason):
+        self._append(f"{SKIP_MARK}{day} {reason}\n"); self.skipped.add(day)
+
+
+# ----------------------------------------------------------------------------- shipping a batch
+def wait_until(cond, what, a):
+    """Sleep-poll (no busy loop) until cond() is true; a short note every wait_note_s seconds."""
+    t0 = last = time.time()
+    while not cond():
+        time.sleep(a.wait_poll_s)
+        if time.time() - last >= a.wait_note_s:
+            log(f"WAIT {what} ({(time.time() - t0) / 3600:.1f} h so far)"); last = time.time()
+
+
+def ship(a, stage, n):
+    """Pack staged files into one tar (adding then deleting each file, so the disk peak is one file) and hand it off."""
+    files = sorted(f for f in os.listdir(stage) if os.path.isfile(os.path.join(stage, f)))
     if a.remote == "hold":
         ready = os.path.join(a.work, "ready"); os.makedirs(ready, exist_ok=True)
         tar = os.path.join(ready, f"batch_{n:02d}.tar")
-        files = sorted(os.listdir(stage))
-        import tarfile
-        with tarfile.open(tar + ".part", "w") as tf:          # add then delete each file: disk peak = 1 file
+        with tarfile.open(tar + ".part", "w") as tf:
             for f in files:
-                tf.add(os.path.join(stage, f), arcname=f"batch_{n:02d}/{f}"); os.remove(os.path.join(stage, f))
-        os.rename(tar + ".part", tar)                      # one file: download it, then delete it
-        log(f"READY {tar} ({os.path.getsize(tar)/1e9:.2f} GB) - download it, then: rm {tar}")
-        while os.path.exists(tar):
-            time.sleep(30)
+                tf.add(os.path.join(stage, f), arcname=f"batch_{n:02d}/{f}")
+                os.remove(os.path.join(stage, f))
+        os.rename(tar + ".part", tar)
+        log(f"READY {tar} ({os.path.getsize(tar) / 1e9:.2f} GB) - download it, then: rm {tar}")
+        wait_until(lambda: not os.path.exists(tar), f"for {os.path.basename(tar)} to be downloaded and deleted", a)
         return True
-    dest = f"{a.remote}/batch_{n:02d}"
+    dest = f"{a.remote}/batch_{n:02d}"                        # rclone route (if the remote is reachable)
     for attempt in range(1, a.retries + 1):
-        r = subprocess.run([a.rclone, "copy", stage, dest, "--transfers", "4", "--retries", "3", "--low-level-retries", "10",
-                            "--stats", "0", "--log-level", "ERROR"], capture_output=True, text=True)
+        r = subprocess.run([a.rclone, "copy", stage, dest, "--transfers", "4", "--stats", "0", "--log-level", "ERROR"],
+                           capture_output=True, text=True)
         c = subprocess.run([a.rclone, "check", stage, dest, "--one-way", "--size-only", "--log-level", "ERROR"],
                            capture_output=True, text=True)
         if r.returncode == 0 and c.returncode == 0:
+            for f in files:
+                os.remove(os.path.join(stage, f))
             return True
         log(f"upload batch_{n:02d} attempt {attempt} failed: {(r.stderr or c.stderr).strip()[-300:]}")
         time.sleep(60 * attempt)
     return False
 
 
+# ----------------------------------------------------------------------------- main loop
 def main():
+    D = DEFAULTS
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--from", dest="d0", default="20250203")
-    ap.add_argument("--to", dest="d1", default="20250430")
-    ap.add_argument("--remote", required=True, help="rclone remote:path, or 'hold' to wait for pull_batches.sh on the Mac")
-    ap.add_argument("--iex-glob", default="")
-    ap.add_argument("--work", default=os.path.expanduser("~/myproject/overnight"))
-    ap.add_argument("--state", default=os.path.expanduser("~/myproject/overnight_done.txt"))
-    ap.add_argument("--batch-gb", type=float, default=7.5)
-    ap.add_argument("--min-free-gb", type=float, default=5.0)
-    ap.add_argument("--cme-port", type=int, default=0)
-    ap.add_argument("--jobs", type=int, default=8, help="days parsed in parallel")
-    ap.add_argument("--day-gb", type=float, default=1.0, help="disk room reserved per parallel day")
-    ap.add_argument("--cme-threads", type=int, default=32)
-    ap.add_argument("--extra-secids", default="")
-    ap.add_argument("--iex-python", default="")
-    ap.add_argument("--nq-night", action="store_true", help="NQ-only overnight pass (20:00 prev -> 04:00); use its own --work/--state")
-    ap.add_argument("--rclone", default=os.path.expanduser("~/bin/rclone"))
-    ap.add_argument("--retries", type=int, default=5)
+    ap.add_argument("--from", dest="d0", default=D["d0"])
+    ap.add_argument("--to", dest="d1", default=D["d1"])
+    ap.add_argument("--center", default=D["center"], help="pull outward from this day; '' = calendar order")
+    ap.add_argument("--work", default=D["work"])
+    ap.add_argument("--state", default=D["state"])
+    ap.add_argument("--remote", default=D["remote"], help="'hold' (download by hand) or an rclone remote:path")
+    ap.add_argument("--batch-gb", type=float, default=D["batch_gb"], help="ship when staging reaches this (or disk is low)")
+    ap.add_argument("--min-free-gb", type=float, default=D["min_free_gb"], help="hard disk floor")
+    ap.add_argument("--day-gb", type=float, default=D["day_gb"], help="disk reserved per day running in parallel")
+    ap.add_argument("--jobs", type=int, default=D["jobs"], help="max days parsed at once")
+    ap.add_argument("--cme-threads", type=int, default=D["cme_threads"])
+    ap.add_argument("--cme-port", type=int, default=D["cme_port"], help="CME channel port; 0 = all channels")
+    ap.add_argument("--iex-glob", default=D["iex_glob"], help="'' = no IEX")
+    ap.add_argument("--iex-python", default=D["iex_python"], help="PyPy for iex_parse.py (used if it exists)")
+    ap.add_argument("--secids-file", default=D["secids_file"], help="extra CME contracts, LABEL=SecurityID per line")
+    ap.add_argument("--extra-secids", default="", help="extra CME contracts inline (added to --secids-file)")
+    ap.add_argument("--nq-night", action="store_true", help="NQ-only overnight pass; use its own --work and --state")
+    ap.add_argument("--rclone", default=D["rclone"])
+    ap.add_argument("--retries", type=int, default=D["retries"])
+    ap.add_argument("--wait-poll-s", type=int, default=D["wait_poll_s"])
+    ap.add_argument("--wait-note-s", type=int, default=D["wait_note_s"])
     ap.add_argument("--puller", default=os.path.join(HERE, "day_pull.py"), help=argparse.SUPPRESS)
     a = ap.parse_args()
     if a.remote != "hold" and not os.access(a.rclone, os.X_OK):
         sys.exit(f"rclone not found at {a.rclone}")
+
+    secids = [s.strip() for s in a.extra_secids.split(",") if s.strip()]
+    if os.path.exists(a.secids_file):
+        secids += [l.strip() for l in open(a.secids_file) if "=" in l and not l.lstrip().startswith("#")]
+    secids = ",".join(dict.fromkeys(secids))
+    iex_python = a.iex_python if a.iex_python and os.access(a.iex_python, os.X_OK) else ""
+    key = "nq_night_" if a.nq_night else "ticks_"            # a day is complete once this file exists (written last)
+
     stage = os.path.join(a.work, "stage"); os.makedirs(stage, exist_ok=True)
-    done = {l.strip() for l in open(a.state) if l.strip() and not l.startswith("batch ")} if os.path.exists(a.state) else set()
-    # a day counts as staged only if its ticks file exists (written last); remove leftovers of half-finished days
-    key = "nq_night_" if a.nq_night else "ticks_"
-    staged = sorted({f[len(key):len(key) + 8] for f in os.listdir(stage) if f.startswith(key) and f[len(key):len(key) + 8].isdigit()})
-    for f in os.listdir(stage):
+    shutil.rmtree(os.path.join(stage, "raw"), ignore_errors=True)
+    staged = {f[len(key):len(key) + 8] for f in os.listdir(stage) if f.startswith(key)}
+    for f in os.listdir(stage):                               # leftovers of half-finished days
         p = os.path.join(stage, f)
         if os.path.isfile(p) and not any(d in f for d in staged):
             os.remove(p)
-    shutil.rmtree(os.path.join(stage, "raw"), ignore_errors=True)
-    n = 1 + max([int(l.split()[1]) for l in open(a.state) if l.startswith("batch ")] or [0]) if os.path.exists(a.state) else 1
-    todo = [d for d in weekdays(a.d0, a.d1) if d not in done and d not in staged]
-    log(f"start: {len(todo)} days to pull, {len(staged)} staged, {len(done)} done; free {free_gb(a.work):.1f} GB; batch {a.batch_gb} GB")
 
-    def flush(final=False):
-        nonlocal n, staged
+    st = State(a.state)
+    todo = center_out([d for d in weekdays(a.d0, a.d1) if d not in st.done | st.skipped | staged], a.center)
+    log(f"start: {len(todo)} days to pull, {len(staged)} staged, {len(st.done)} done, {len(st.skipped)} skipped; "
+        f"free {free_gb(a.work):.1f} GB; jobs {a.jobs}; cme port {a.cme_port}; extra contracts {secids.count('=')}; "
+        f"iex {'pypy' if iex_python else 'python'}; order {'center ' + a.center if a.center else 'calendar'}")
+
+    def flush(force):
+        nonlocal staged
         if not os.listdir(stage):
             return
         gb = du_gb(stage)
-        if not final and gb < a.batch_gb:
+        if not force and gb < a.batch_gb:
             return
-        days = sorted({f.split("_")[-1].split(".")[0] for f in os.listdir(stage) if f.endswith(".parquet")} | set(staged))
-        if not upload(a, stage, n):
-            log(f"STOP: upload of batch_{n:02d} failed after {a.retries} tries; data kept in {stage}; re-run to resume")
-            sys.exit(2)
-        for f in os.listdir(stage):
-            os.remove(os.path.join(stage, f))
-        with open(a.state, "a") as fh:
-            fh.write(f"batch {n} {' '.join(days)}\n" + "".join(d + "\n" for d in days))
-        log(f"UPLOADED batch_{n:02d}: {len(days)} days {days[0]}..{days[-1]}, {gb:.2f} GB; free {free_gb(a.work):.1f} GB")
-        n += 1; staged = []
+        days = sorted(staged)
+        n = st.last_batch + 1
+        if not ship(a, stage, n):
+            log(f"STOP: batch_{n:02d} could not be shipped; data kept in {stage}; re-run to resume"); sys.exit(2)
+        st.mark_batch(n, days)
+        log(f"SHIPPED batch_{n:02d}: {len(days)} days ({', '.join(days)}), {gb:.2f} GB; free {free_gb(a.work):.1f} GB")
+        staged = set()
 
-    done_n, J = 0, max(1, a.jobs)
-    while done_n < len(todo):
-        # each parallel day needs ~day_gb of room; ship what's staged first if the disk can't hold a full group
-        if free_gb(a.work) < a.min_free_gb + 2 + a.day_gb * J:
-            flush(final=True)
-        room = int((free_gb(a.work) - a.min_free_gb - 2) // a.day_gb)
-        k = min(J, max(room, 0), len(todo) - done_n)
-        if k < 1:
-            log(f"STOP: free disk {free_gb(a.work):.1f} GB too low before {todo[done_n]}"); sys.exit(3)
-        group = todo[done_n:done_n + k]
-        t = time.time(); procs = {}
+    def room():
+        return int((free_gb(a.work) - a.min_free_gb - 2) // a.day_gb)
+
+    i = 0
+    while i < len(todo):
+        if room() < min(a.jobs, len(todo) - i):
+            flush(force=True)                                 # make room by shipping what is staged
+        if room() < 1:
+            wait_until(lambda: room() >= 1, f"for disk (free {free_gb(a.work):.1f} GB; another user may be using it)", a)
+        group = todo[i:i + max(1, min(a.jobs, room(), len(todo) - i))]
+        t0 = time.time(); procs = {}
         for d in group:
-            cmd = [sys.executable, a.puller, "--from", d, "--to", d, "--out-dir", stage, "--min-free-gb", str(a.min_free_gb),
-                   "--cme-threads", str(a.cme_threads)]
-            if a.iex_glob:
-                cmd += ["--iex-glob", a.iex_glob]
-            if a.cme_port:
-                cmd += ["--cme-port", str(a.cme_port)]
-            if a.extra_secids:
-                cmd += ["--extra-secids", a.extra_secids]
-            if a.iex_python:
-                cmd += ["--iex-python", a.iex_python]
-            if a.nq_night:
-                cmd += ["--nq-night"]
+            cmd = [sys.executable, a.puller, "--from", d, "--to", d, "--out-dir", stage,
+                   "--min-free-gb", str(a.min_free_gb), "--cme-threads", str(a.cme_threads)]
+            cmd += ["--cme-port", str(a.cme_port)] if a.cme_port else []
+            cmd += ["--iex-glob", a.iex_glob] if a.iex_glob else []
+            cmd += ["--iex-python", iex_python] if iex_python else []
+            cmd += ["--extra-secids", secids] if secids else []
+            cmd += ["--nq-night"] if a.nq_night else []
             procs[d] = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        outs = {d: p.communicate() for d, p in procs.items()}
-        for f in os.listdir(stage):                     # parser logs are not data we keep
+        outs = {d: p.communicate() for d, p in procs.items()}  # blocks until the whole group is done
+        secs = time.time() - t0
+        for f in os.listdir(stage):                           # per-day parser logs are not kept
             if f.startswith("log_"):
                 os.remove(os.path.join(stage, f))
         for d in group:
-            so, se = outs[d]; done_n += 1
-            for line in so.splitlines():
-                if line.startswith(("INCOMPLETE", "free disk below")):
+            out, err = outs[d]
+            for line in out.splitlines():
+                if line.startswith("INCOMPLETE"):
                     log(line)
-            got = os.path.exists(os.path.join(stage, f"{'nq_night' if a.nq_night else 'ticks'}_{d}.parquet"))
-            if not got:                                 # drop partial files of a failed day
-                for f in os.listdir(stage):
+            if os.path.exists(os.path.join(stage, f"{key}{d}.parquet")):
+                staged.add(d)
+                log(f"{d}: ok in {secs:.0f}s ({len(group)} in parallel); staged {du_gb(stage):.2f} GB ({i + 1}/{len(todo)})")
+            else:
+                for f in os.listdir(stage):                   # drop partial files of this day
                     if d in f and os.path.isfile(os.path.join(stage, f)):
                         os.remove(os.path.join(stage, f))
-                with open(a.state, "a") as fh:
-                    fh.write(d + "\n")                   # holiday / missing feed: don't retry every run
-                if "INCOMPLETE" not in so:
-                    log(f"INCOMPLETE {d} | all | no output (exit {procs[d].returncode}) {se.strip()[-200:]}")
-            log(f"{d}: {'ok' if got else 'NO OUTPUT'} in {time.time()-t:.0f}s ({k} days in parallel); stage {du_gb(stage):.2f} GB ({done_n}/{len(todo)})")
-        flush()
-    flush(final=True)
-    shutil.rmtree(stage, ignore_errors=True)
+                if "missing files" in out:
+                    st.mark_skip(d, "no-data-on-vm")          # holiday or capture gap: never retried
+                    log(f"{d}: skipped (no data on the VM) ({i + 1}/{len(todo)})")
+                else:                                         # parser problem: retried on the next run
+                    log(f"INCOMPLETE {d} | parse failed (exit {procs[d].returncode}); retried next run: {err.strip()[-200:]}")
+            i += 1
+        flush(force=False)
+    flush(force=True)
     log("ALL DONE")
 
 
