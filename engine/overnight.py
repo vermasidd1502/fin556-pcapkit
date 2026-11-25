@@ -114,6 +114,8 @@ def wait_until(cond, what, a):
 def ship(a, stage, n):
     """Pack staged files into one tar (adding then deleting each file, so the disk peak is one file) and hand it off."""
     files = sorted(f for f in os.listdir(stage) if os.path.isfile(os.path.join(stage, f)))
+    if a.remote == "keep":                                   # local run: finished days simply stay in the stage folder
+        return True
     if a.remote == "hold":
         ready = os.path.join(a.work, "ready"); os.makedirs(ready, exist_ok=True)
         tar = os.path.join(ready, f"batch_{n:02d}.tar")
@@ -149,7 +151,7 @@ def main():
     ap.add_argument("--center", default=D["center"], help="pull outward from this day; '' = calendar order")
     ap.add_argument("--work", default=D["work"])
     ap.add_argument("--state", default=D["state"])
-    ap.add_argument("--remote", default=D["remote"], help="'hold' (download by hand) or an rclone remote:path")
+    ap.add_argument("--remote", default=D["remote"], help="'hold' (download by hand), 'keep' (local run) or an rclone remote:path")
     ap.add_argument("--batch-gb", type=float, default=D["batch_gb"], help="ship when staging reaches this (or disk is low)")
     ap.add_argument("--min-free-gb", type=float, default=D["min_free_gb"], help="hard disk floor")
     ap.add_argument("--day-gb", type=float, default=D["day_gb"], help="disk reserved per day running in parallel")
@@ -160,6 +162,8 @@ def main():
     ap.add_argument("--iex-python", default=D["iex_python"], help="PyPy for iex_parse.py (used if it exists)")
     ap.add_argument("--secids-file", default=D["secids_file"], help="extra CME contracts, LABEL=SecurityID per line")
     ap.add_argument("--extra-secids", default="", help="extra CME contracts inline (added to --secids-file)")
+    ap.add_argument("--venues", default="xnas,glbx,iex", help="feeds to parse; e.g. xnas for a Nasdaq-only local run")
+    ap.add_argument("--xnas-remote", default="", help="Nasdaq captures from an rclone remote, e.g. box:db/xnas_pcaps")
     ap.add_argument("--nq-night", action="store_true", help="NQ-only overnight pass; use its own --work and --state")
     ap.add_argument("--rclone", default=D["rclone"])
     ap.add_argument("--retries", type=int, default=D["retries"])
@@ -167,7 +171,7 @@ def main():
     ap.add_argument("--wait-note-s", type=int, default=D["wait_note_s"])
     ap.add_argument("--puller", default=os.path.join(HERE, "day_pull.py"), help=argparse.SUPPRESS)
     a = ap.parse_args()
-    if a.remote != "hold" and not os.access(a.rclone, os.X_OK):
+    if a.remote not in ("hold", "keep") and not os.access(a.rclone, os.X_OK):
         sys.exit(f"rclone not found at {a.rclone}")
 
     secids = [s.strip() for s in a.extra_secids.split(",") if s.strip()]
@@ -198,13 +202,17 @@ def main():
         gb = du_gb(stage)
         if not force and gb < a.batch_gb:
             return
-        days = sorted(staged)
+        days = sorted(staged - st.done)
+        if not days:
+            return
         n = st.last_batch + 1
         if not ship(a, stage, n):
             log(f"STOP: batch_{n:02d} could not be shipped; data kept in {stage}; re-run to resume"); sys.exit(2)
         st.mark_batch(n, days)
-        log(f"SHIPPED batch_{n:02d}: {len(days)} days ({', '.join(days)}), {gb:.2f} GB; free {free_gb(a.work):.1f} GB")
-        staged = set()
+        if a.remote != "keep":
+            staged = set()
+        log(f"{'SAVED' if a.remote == 'keep' else 'SHIPPED'} batch_{n:02d}: {len(days)} days ({', '.join(days)}), "
+            f"{gb:.2f} GB; free {free_gb(a.work):.1f} GB")
 
     def room():
         return int((free_gb(a.work) - a.min_free_gb - 2) // a.day_gb)
@@ -225,6 +233,8 @@ def main():
             cmd += ["--iex-python", iex_python] if iex_python else []
             cmd += ["--extra-secids", secids] if secids else []
             cmd += ["--nq-night"] if a.nq_night else []
+            cmd += ["--venues", a.venues, "--rclone", a.rclone]
+            cmd += ["--xnas-remote", a.xnas_remote] if a.xnas_remote else []
             procs[d] = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         outs = {d: p.communicate() for d, p in procs.items()}  # blocks until the whole group is done
         secs = time.time() - t0
@@ -243,7 +253,7 @@ def main():
                 for f in os.listdir(stage):                   # drop partial files of this day
                     if d in f and os.path.isfile(os.path.join(stage, f)):
                         os.remove(os.path.join(stage, f))
-                if "missing files" in out:
+                if "| all | missing files" in out:
                     st.mark_skip(d, "no-data-on-vm")          # holiday or capture gap: never retried
                     log(f"{d}: skipped (no data on the VM) ({i + 1}/{len(todo)})")
                 else:                                         # parser problem: retried on the next run

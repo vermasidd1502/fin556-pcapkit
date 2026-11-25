@@ -28,7 +28,8 @@ import pyarrow as pa, pyarrow.compute as pc, pyarrow.csv as pacsv, pyarrow.parqu
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 from datetime import timedelta
-from ndx_combine import NS, daterange, et_ns, select_files  # noqa: E402
+from ndx_combine import FN, NS, daterange, et_ns, select_files  # noqa: E402
+from datetime import datetime, timezone
 
 STOCKS = "NVDA,TSLA,AAPL,AMD,AMZN,AVGO,COIN,GOOGL,META,MSFT,MSTR,PLTR"
 INDEX = "QQQ,TQQQ,SQQQ"
@@ -213,22 +214,40 @@ def do_nq_night(day, a, raw):
     return 1
 
 
+def remote_files(a, remote, day, t0, t1):
+    """Same selection as select_files, but listing a cloud folder with `rclone lsf` (names only)."""
+    out = []
+    for dd in (day - timedelta(days=1), day, day + timedelta(days=1)):
+        r = subprocess.run([a.rclone, "lsf", "--files-only", f"{remote}/{dd:%Y%m%d}"], capture_output=True, text=True)
+        for name in r.stdout.split():
+            m = FN.search(name)
+            if not m:
+                continue
+            s = int(datetime.strptime(m.group(1) + m.group(2), "%Y%m%d%H%M%S").replace(tzinfo=timezone.utc).timestamp()) * NS
+            if s + 600 * NS > t0 and s < t1:
+                out.append((s, f"{remote}/{dd:%Y%m%d}/{name}"))
+    return [p for _, p in sorted(out)]
+
+
 def do_day(day, a, raw):
     tag = day.strftime("%Y%m%d")
     t0, t1, mid = et_ns(day, a.start), et_ns(day, a.end), et_ns(day, "00:00")
-    itch = select_files(a.xnas_root, day, t0, t1)
-    cme = select_files(a.glbx_root, day, t0, t1)
-    iex = sorted(glob.glob(a.iex_glob.format(date=tag))) if a.iex_glob else []
-    print(f"{tag}: xnas {len(itch)} files {sum(map(os.path.getsize, itch))/1e9:.1f} GB, glbx {len(cme)} files "
-          f"{sum(map(os.path.getsize, cme))/1e9:.1f} GB, iex {len(iex)} files "
-          f"{sum(map(os.path.getsize, iex))/1e9:.1f} GB, NQ {nq_for(tag)}", flush=True)
+    want = set(a.venues.split(","))
+    itch = (remote_files(a, a.xnas_remote, day, t0, t1) if a.xnas_remote else select_files(a.xnas_root, day, t0, t1)) \
+        if "xnas" in want else []
+    cme = select_files(a.glbx_root, day, t0, t1) if "glbx" in want else []
+    iex = sorted(glob.glob(a.iex_glob.format(date=tag))) if a.iex_glob and "iex" in want else []
+    gb = lambda fs: sum(os.path.getsize(f) for f in fs if os.path.exists(f)) / 1e9
+    print(f"{tag}: xnas {len(itch)} files{' (remote)' if a.xnas_remote else f' {gb(itch):.1f} GB'}, glbx {len(cme)} files "
+          f"{gb(cme):.1f} GB, iex {len(iex)} files {gb(iex):.1f} GB, NQ {nq_for(tag)}", flush=True)
     if a.dry_run:
         return None
-    if not itch:
-        print(f"INCOMPLETE {tag} | xnas | missing files", flush=True)
+    for v, fs in (("xnas", itch), ("glbx", cme), ("iex", iex)):
+        if v in want and not fs and (v != "iex" or a.iex_glob):
+            print(f"INCOMPLETE {tag} | {v} | missing files (other feeds kept)", flush=True)
+    if not (itch or cme or iex):                     # nothing requested exists for this day (holiday / gap)
+        print(f"INCOMPLETE {tag} | all | missing files", flush=True)
         return None
-    if not cme:                                      # still keep Nasdaq + IEX for the day (e.g. CME gap on the VM)
-        print(f"INCOMPLETE {tag} | glbx | missing files (Nasdaq/IEX kept)", flush=True)
     xb, gb, ib = (os.path.join(raw, f"{v}_{tag}") for v in ("xnas", "glbx", "iex"))
     out = lambda n: os.path.join(a.out_dir, f"{n}_{tag}.parquet")
     log = os.path.join(a.out_dir, f"log_{tag}.txt")
@@ -254,8 +273,10 @@ def do_day(day, a, raw):
         t = t.combine_chunks()
         return t.to_batches()[0] if t.num_rows else None
 
-    sinks = {"xq": Sink(xb + "_bbo.csv", xw), "xt": Sink(xb + "_trades.csv", xtr), "xn": Sink(xb + "_noii.csv", xw),
-             "xm": Sink(xb + "_mpid.csv", xw)}
+    sinks = {}
+    if itch:
+        sinks.update({"xq": Sink(xb + "_bbo.csv", xw), "xt": Sink(xb + "_trades.csv", xtr),
+                      "xn": Sink(xb + "_noii.csv", xw), "xm": Sink(xb + "_mpid.csv", xw)})
     if cme:
         sinks.update({"gq": Sink(gb + "_bbo.csv", cme_bbo),
                       "gt": Sink(gb + "_trades.csv", lambda b: (lambda t: t.to_batches()[0] if t.num_rows else None)(bwin(b, "ts_event_ns", t0, t1)))})
@@ -263,7 +284,12 @@ def do_day(day, a, raw):
         sinks.update({"iq": Sink(ib + "_bbo.csv"), "it": Sink(ib + "_trades.csv"), "ia": Sink(ib + "_auction.csv"),
                       "il": Sink(ib + "_levels.csv", lambda b: lev_w.add(b))})
     lf = open(log, "a")
-    procs = {"xnas": subprocess.Popen([sys.executable, feed, os.path.join(HERE, "itch_noii"), "--symbols", SYMS, "--out", xb, "--"] + itch, stdout=lf, stderr=subprocess.STDOUT)}
+    itch_cmd = [os.path.join(HERE, "itch_noii"), "--symbols", SYMS, "--out", xb]
+    if a.xnas_remote:                                 # stream from the cloud: rclone cat -> zstd -> parser stdin
+        xcmd = [sys.executable, os.path.join(HERE, "box_feed.py"), "--rclone", a.rclone, "--files", ",".join(itch), "--"] + itch_cmd
+    else:
+        xcmd = [sys.executable, feed] + itch_cmd + ["--"] + itch
+    procs = {"xnas": subprocess.Popen(xcmd, stdout=lf, stderr=subprocess.STDOUT)} if itch else {}
     if cme:
         procs["glbx"] = subprocess.Popen([sys.executable, feed, cme_bin, "--secids", ",".join([nq_for(tag)] + ([a.extra_secids] if a.extra_secids else [])), "--display-factor", "0.01", "--depth", str(DEPTH), "--threads", str(a.cme_threads),
                                        "--out", gb] + (["--port", str(a.cme_port)] if a.cme_port else []) + ["--"] + cme, stdout=lf, stderr=subprocess.STDOUT)
@@ -280,23 +306,26 @@ def do_day(day, a, raw):
     bad = [k for k, p in procs.items() if p.returncode]
     for k in bad:
         print(f"INCOMPLETE {tag} | {k} | parser exit {procs[k].returncode} (see {log})", flush=True)
-    if "xnas" in bad or "glbx" in bad or T["xq"] is None or (cme and T["gq"] is None):
+    if "xnas" in bad or "glbx" in bad or (itch and T["xq"] is None) or (cme and T["gq"] is None):
         if not bad:
             print(f"INCOMPLETE {tag} | xnas/glbx | no rows parsed (see {log})", flush=True)
         return None
 
-    parts = [conform(T["xq"], {"venue": "XNAS", "type": "Q"})]
-    t = T["xt"] if T["xt"] is not None else pa.table({c: pa.array([], CONV.column_types[c]) for c in
-        ["ts_recv_ns", "ts_event_ns", "symbol", "price", "size", "kind", "aggressor", "match_no", "cross_type"]})
+    parts = []
+    empty_tr = pa.table({c: pa.array([], CONV.column_types[c]) for c in
+                         ["ts_recv_ns", "ts_event_ns", "symbol", "price", "size", "kind", "aggressor", "match_no", "cross_type"]})
+    t = T.get("xt") if T.get("xt") is not None else empty_tr
     isq = pc.fill_null(pc.equal(t["kind"], "Q"), False)
     cr = t.filter(isq)
     t = t.filter(pc.invert(isq)).rename_columns(["trade_id" if c == "match_no" else c for c in t.column_names])
-    parts.append(conform(t, {"venue": "XNAS", "type": "T"}))
-    write(cr.select(["ts_recv_ns", "ts_event_ns", "symbol", "price", "size", "cross_type", "match_no"]), out("crosses"))
-    n = T["xn"] if T["xn"] is not None else pa.table({"ts_event_ns": pa.array([], pa.int64())})
-    write(n, out("noii"))
-    if T["xm"] is not None:
-        write(T["xm"], out("mpid"))                  # attributed adds: which firm posted which order
+    n = T.get("xn") if T.get("xn") is not None else pa.table({"ts_event_ns": pa.array([], pa.int64())})
+    if itch:
+        parts.append(conform(T["xq"], {"venue": "XNAS", "type": "Q"}))
+        parts.append(conform(t, {"venue": "XNAS", "type": "T"}))
+        write(cr.select(["ts_recv_ns", "ts_event_ns", "symbol", "price", "size", "cross_type", "match_no"]), out("crosses"))
+        write(n, out("noii"))
+        if T["xm"] is not None:
+            write(T["xm"], out("mpid"))              # attributed adds: which firm posted which order
     if cme:
         parts.append(conform(T["gq"], {"venue": "GLBX", "type": "Q"}))
     if cme and T["gt"] is not None:
@@ -309,6 +338,9 @@ def do_day(day, a, raw):
             parts.append(conform(it.set_column(it.column_names.index("sale_flags"), "kind", pc.cast(it["sale_flags"], pa.string())), {"venue": "IEXG", "type": "T"}))
         if T["ia"] is not None:
             write(T["ia"], out("iex_auction"))
+    if not parts:
+        print(f"INCOMPLETE {tag} | all | no rows parsed (see {log})", flush=True)
+        return None
     ticks = pa.concat_tables(parts)
     ticks = ticks.take(pc.sort_indices(ticks, [("ts_event_ns", "ascending")]))
     write(ticks, out("ticks"))
@@ -322,7 +354,7 @@ def do_day(day, a, raw):
              if os.path.exists(out(x))) / 1e6
     print(f"{tag}: {cnt}; hidden execs {hidden}; noii {n.num_rows}; cross prints {cr.num_rows}; "
           f"closing cross {len(ccs)} syms; {mb:.0f} MB", flush=True)
-    if miss:
+    if miss and itch:
         print(f"INCOMPLETE {tag} | xnas | closing cross missing for {','.join(miss)}", flush=True)
     return 1
 
@@ -339,6 +371,9 @@ def main():
     ap.add_argument("--out-dir", default=os.path.expanduser("~/myproject/pull_out"))
     ap.add_argument("--min-free-gb", type=float, default=5.0)
     ap.add_argument("--cme-port", type=int, default=0, help="UDP port of NQ's CME channel: skip all other channels before decoding")
+    ap.add_argument("--venues", default="xnas,glbx,iex", help="which feeds to parse, e.g. xnas (Nasdaq only)")
+    ap.add_argument("--xnas-remote", default="", help="read Nasdaq captures from an rclone remote, e.g. box:db/xnas_pcaps")
+    ap.add_argument("--rclone", default=os.path.expanduser("~/rclone") if sys.platform == "darwin" else os.path.expanduser("~/bin/rclone"))
     ap.add_argument("--iex-python", default="", help="interpreter for iex_parse.py, e.g. ~/pypy/bin/pypy3 (~10x faster)")
     ap.add_argument("--extra-secids", default="", help="more CME contracts on the same channel, e.g. MNQM5=123,ESM5=456 (label=SecurityID)")
     ap.add_argument("--cme-threads", type=int, default=32)
