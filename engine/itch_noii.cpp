@@ -117,7 +117,7 @@ struct Parser {
     std::vector<Book> books;
     std::unordered_map<u64, int> by8;
     std::unordered_map<u64, Order> orders;
-    Out bbo, trd, noi;
+    Out bbo, trd, noi, mpd;
     u64 tc[256] = {0};
     u64 bad_msgs = 0, n_msgs = 0;
     u8 cls[65536];   // per stock-locate: 0 unknown, 1 tracked symbol, 2 other symbol (learned from R/A/F/P/Q messages)
@@ -188,6 +188,12 @@ struct Parser {
                 i64 sh = be32(m + 20);
                 orders[be64(m + 11)] = Order{bi, is_bid, px, sh};
                 books[bi].add(is_bid, px, sh);
+                if (m[0] == 'F' && n >= 40) {   // attributed add: market participant ID (MPID) at offset 36
+                    mpd.i(ts_recv); mpd.b.push_back(','); mpd.i(ts); mpd.b.push_back(','); mpd.b += books[bi].sym; mpd.b.push_back(',');
+                    mpd.b.push_back(is_bid ? 'B' : 'S'); mpd.b.push_back(','); mpd.i((u64)sh); mpd.b.push_back(','); mpd.px(px);
+                    mpd.b.push_back(','); for (int q = 36; q < 40; q++) if (m[q] != ' ') mpd.b.push_back((char)m[q]);
+                    mpd.b.push_back(','); mpd.i(be64(m + 11)); mpd.b.push_back('\n'); mpd.rows++; mpd.check();
+                }
                 post(bi, ts_recv, ts);
                 break;
             }
@@ -399,6 +405,7 @@ int main(int argc, char **argv) {
     P.orders.reserve(1 << 20);
     P.bbo.open(out + "_bbo.csv", "ts_recv_ns,ts_itch_ns,symbol,bid_px,bid_sz,ask_px,ask_sz\n");
     P.trd.open(out + "_trades.csv", "ts_recv_ns,ts_itch_ns,symbol,price,size,kind,aggressor,match_no,cross_type\n");
+    P.mpd.open(out + "_mpid.csv", "ts_recv_ns,ts_itch_ns,symbol,side,shares,price,mpid,order_ref\n");
     P.noi.open(out + "_noii.csv", "ts_recv_ns,ts_itch_ns,symbol,paired,imbalance,direction,far_px,near_px,ref_px,cross_type,pvi\n");
     Sequencer Q(P, window);
     Reader rd;
@@ -486,6 +493,7 @@ int main(int argc, char **argv) {
     P.bbo.close();
     P.trd.close();
     P.noi.close();
+    P.mpd.close();
     double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     fprintf(stderr, "itch_fast: %llu files, %llu packets, %llu itch messages in %.1fs\n", (unsigned long long)files, (unsigned long long)npk,
             (unsigned long long)P.n_msgs, secs);

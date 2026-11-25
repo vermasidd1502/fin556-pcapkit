@@ -98,7 +98,7 @@ struct CmeShard {
         b.lasta = ka;
         hft3::ShardOut &o = out[0];
         o.begin_row();
-        o.u(ts_recv); o.push_back(','); o.u(ts_ev); o.push_back(','); o.u(flags); o.push_back(','); o.str(g_syms[bi]);
+        o.u(ts_recv); o.push_back(','); o.u(ts_ev); o.push_back(','); o.u(cur_send); o.push_back(','); o.u(flags); o.push_back(','); o.str(g_syms[bi]);
         for (int i = 0; i < g_depth; i++) {
             o.push_back(','); price(o, kb[i].px); o.push_back(','); o.i(kb[i].sz); o.push_back(','); o.i(kb[i].ct);
             o.push_back(','); price(o, ka[i].px); o.push_back(','); o.i(ka[i].sz); o.push_back(','); o.i(ka[i].ct);
@@ -163,15 +163,17 @@ struct CmeShard {
             u8 ag = pl[off + 24];
             hft3::ShardOut &o = out[1];
             o.begin_row();
-            o.u(ts_recv); o.push_back(','); o.u(ts_ev); o.push_back(','); o.u(flags); o.push_back(','); o.str(g_syms[it->second]); o.push_back(',');
+            o.u(ts_recv); o.push_back(','); o.u(ts_ev); o.push_back(','); o.u(cur_send); o.push_back(','); o.u(flags); o.push_back(','); o.str(g_syms[it->second]); o.push_back(',');
             price(o, (i64)le64(pl + off)); o.push_back(','); o.i((i32)le32(pl + off + 8)); o.push_back(',');
             if (ag == 1) o.push_back('B'); else if (ag == 2) o.push_back('S');
             o.push_back(','); o.i((i32)le32(pl + off + 20)); o.push_back(','); o.u(rpt); o.push_back(','); o.u(pl[off + 25]); o.push_back('\n');
             o.end_row();
         }
     }
+    u64 cur_send = 0;
     void handle(u64 ts_recv, const u8 *pl, u32 n) {   // one UDP payload (one MDP3 packet)
         if (n < 12) return;
+        cur_send = le64(pl + 4);                      // packet SendingTime (ns, UTC)
         if (n >= 22 && le16(pl + 18) != 1) { other_schema++; return; }
         size_t pos = 12;
         while (pos + 10 <= n) {
@@ -232,7 +234,7 @@ int main(int argc, char **argv) {
     int K = std::max(2, std::min(8, threads / 4));
     int S = std::max(1, std::min(threads - K - 3, 12));
 
-    std::string hb = "ts_recv_ns,ts_event_ns,flags,symbol";
+    std::string hb = "ts_recv_ns,ts_event_ns,ts_send_ns,flags,symbol";
     for (int i = 0; i < g_depth; i++) {
         char t[128];
         snprintf(t, sizeof t, ",bid_px_%02d,bid_sz_%02d,bid_ct_%02d,ask_px_%02d,ask_sz_%02d,ask_ct_%02d", i, i, i, i, i, i);
@@ -241,7 +243,7 @@ int main(int argc, char **argv) {
     hft::Writer wr(-1);
     hft::Out bbo, trd;
     bbo.open(wr, out + "_bbo.csv", hb + "\n");
-    trd.open(wr, out + "_trades.csv", "ts_recv_ns,ts_event_ns,flags,symbol,price,size,aggressor,num_orders,rpt_seq,action\n");
+    trd.open(wr, out + "_trades.csv", "ts_recv_ns,ts_event_ns,ts_send_ns,flags,symbol,price,size,aggressor,num_orders,rpt_seq,action\n");
 
     hft3::Sharder sharder(S, 4u << 20, 16384);
     std::vector<std::unique_ptr<hft3::Shard<CmeShard>>> shards;

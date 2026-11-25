@@ -34,13 +34,14 @@ STOCKS = "NVDA,TSLA,AAPL,AMD,AMZN,AVGO,COIN,GOOGL,META,MSFT,MSTR,PLTR"
 INDEX = "QQQ,TQQQ,SQQQ"
 LEV = ("AAPB,AAPD,AAPU,AMDG,AMDL,AMDD,AMUU,AMZD,AMZU,AMZZ,AVGX,AVL,AVS,CONI,CONL,COIG,FBL,METD,METU,GGLL,GGLS,"
        "MSFD,MSFL,MSFU,MSTX,SMST,NVD,NVDD,NVDG,NVDL,NVDS,NVDU,PLTD,PLTU,PTIR,PLTG,TSDD,TSL,TSLG,TSLL,TSLQ,TSLR,TSLS")
-SYMS = ",".join([INDEX, STOCKS, LEV])
+NDX_2025Q1 = "AAPL ADBE ADI ADSK AMAT AMD ANSS APP ARM ASML AVGO CDNS CDW CRWD CSCO CTSH DDOG FTNT GFS INTC INTU KLAC LRCX MCHP MDB MRVL MSFT MSTR MU NVDA NXPI ON PANW PLTR QCOM ROP SNPS TEAM TXN WDAY ZS ABNB AMZN BKNG DASH LULU MAR MELI ORLY PDD ROST SBUX TSLA CHTR CMCSA EA GOOGL GOOG META NFLX TMUS TTD TTWO WBD ADP AXON CPRT CSX CTAS FAST HON ODFL PAYX PCAR VRSK AMGN AZN BIIB DXCM GEHC GILD IDXX ISRG REGN VRTX CCEP COST KDP KHC MDLZ MNST PEP AEP CEG EXC XEL BKR FANG LIN CSGP PYPL"   # Nasdaq-100 members, Q1 2025 (Dec 23 2024 rebalance; 101 securities)
+SYMS = ",".join(dict.fromkeys(",".join([INDEX, STOCKS, LEV]).split(",") + NDX_2025Q1.split()))   # 145 symbols
 NQ_IDS = [("20250317", "NQM5=42005804"), ("00000000", "NQH5=42288528")]   # NQH5 until 2025-03-14
 DEPTH = 10
 TICK_SCHEMA = pa.schema([("ts_recv_ns", pa.int64()), ("ts_event_ns", pa.int64()), ("venue", pa.string()),
                          ("symbol", pa.string()), ("type", pa.string()), ("bid_px", pa.float64()), ("bid_sz", pa.int64()),
                          ("ask_px", pa.float64()), ("ask_sz", pa.int64()), ("price", pa.float64()), ("size", pa.int64()),
-                         ("aggressor", pa.string()), ("trade_id", pa.int64()), ("kind", pa.string())])
+                         ("aggressor", pa.string()), ("trade_id", pa.int64()), ("kind", pa.string()), ("ts_send_ns", pa.int64())])
 STR = pacsv.ConvertOptions(strings_can_be_null=True, column_types={
     "symbol": pa.string(), "kind": pa.string(), "aggressor": pa.string(), "cross_type": pa.string(),
     "direction": pa.string(), "pvi": pa.string(), "side": pa.string(), "auction_type": pa.string(), "imb_side": pa.string()})
@@ -86,8 +87,8 @@ def shift(tbl, col, new, base):
     return tbl.set_column(i, new, pc.add(tbl[col], base))
 
 
-STRCOLS = {"symbol", "kind", "aggressor", "cross_type", "direction", "pvi", "side", "auction_type", "imb_side", "action"}
-NAMES = (["ts_recv_ns", "ts_itch_ns", "ts_event_ns", "flags", "symbol", "bid_px", "bid_sz", "ask_px", "ask_sz", "price", "size",
+STRCOLS = {"mpid", "symbol", "kind", "aggressor", "cross_type", "direction", "pvi", "side", "auction_type", "imb_side", "action"}
+NAMES = (["ts_recv_ns", "ts_itch_ns", "ts_event_ns", "ts_send_ns", "flags", "shares", "mpid", "order_ref", "symbol", "bid_px", "bid_sz", "ask_px", "ask_sz", "price", "size",
           "kind", "aggressor", "match_no", "cross_type", "paired", "imbalance", "direction", "far_px", "near_px", "ref_px", "pvi",
           "num_orders", "rpt_seq", "action", "side", "trade_id", "sale_flags", "auction_type", "ind_clear_px", "imb_side",
           "extension", "sched_time", "book_clear_px", "collar_ref", "lower_collar", "upper_collar"]
@@ -182,9 +183,9 @@ def do_nq_night(day, a, raw):
     def cme_bbo(b):
         t = bwin(b, "ts_event_ns", t0, t1)
         if t.num_rows:
-            depth_w.add(t.select(["ts_recv_ns", "ts_event_ns", "flags"] + [c for c in t.column_names if c[-2:].isdigit() and c[-2:] != "00"]).to_batches()[0])
-            t = t.select(["ts_recv_ns", "ts_event_ns", "symbol", "bid_px_00", "bid_sz_00", "ask_px_00", "ask_sz_00"]) \
-                 .rename_columns(["ts_recv_ns", "ts_event_ns", "symbol", "bid_px", "bid_sz", "ask_px", "ask_sz"])
+            depth_w.add(t.select(["ts_recv_ns", "ts_event_ns", "ts_send_ns", "flags"] + [c for c in t.column_names if c[-2:].isdigit() and c[-2:] != "00"]).to_batches()[0])
+            t = t.select(["ts_recv_ns", "ts_event_ns", "ts_send_ns", "symbol", "bid_px_00", "bid_sz_00", "ask_px_00", "ask_sz_00"]) \
+                 .rename_columns(["ts_recv_ns", "ts_event_ns", "ts_send_ns", "symbol", "bid_px", "bid_sz", "ask_px", "ask_sz"])
         return t.to_batches()[0] if t.num_rows else None
 
     sinks = {"gq": Sink(gb + "_bbo.csv", cme_bbo),
@@ -236,9 +237,9 @@ def do_day(day, a, raw):
     def cme_bbo(b):                                  # stream levels 2-10 to disk, keep L1 in memory
         t = bwin(b, "ts_event_ns", t0, t1)
         if t.num_rows:
-            depth_w.add(t.select(["ts_recv_ns", "ts_event_ns", "flags"] + [c for c in t.column_names if c[-2:].isdigit() and c[-2:] != "00"]).to_batches()[0])
-            t = t.select(["ts_recv_ns", "ts_event_ns", "symbol", "bid_px_00", "bid_sz_00", "ask_px_00", "ask_sz_00"]) \
-                 .rename_columns(["ts_recv_ns", "ts_event_ns", "symbol", "bid_px", "bid_sz", "ask_px", "ask_sz"])
+            depth_w.add(t.select(["ts_recv_ns", "ts_event_ns", "ts_send_ns", "flags"] + [c for c in t.column_names if c[-2:].isdigit() and c[-2:] != "00"]).to_batches()[0])
+            t = t.select(["ts_recv_ns", "ts_event_ns", "ts_send_ns", "symbol", "bid_px_00", "bid_sz_00", "ask_px_00", "ask_sz_00"]) \
+                 .rename_columns(["ts_recv_ns", "ts_event_ns", "ts_send_ns", "symbol", "bid_px", "bid_sz", "ask_px", "ask_sz"])
         return t.to_batches()[0] if t.num_rows else None
 
     def xw(b):                                       # ITCH time = ns since New York midnight
@@ -252,6 +253,7 @@ def do_day(day, a, raw):
         return t.to_batches()[0] if t.num_rows else None
 
     sinks = {"xq": Sink(xb + "_bbo.csv", xw), "xt": Sink(xb + "_trades.csv", xtr), "xn": Sink(xb + "_noii.csv", xw),
+             "xm": Sink(xb + "_mpid.csv", xw),
              "gq": Sink(gb + "_bbo.csv", cme_bbo), "gt": Sink(gb + "_trades.csv", lambda b: (lambda t: t.to_batches()[0] if t.num_rows else None)(bwin(b, "ts_event_ns", t0, t1)))}
     if iex:
         sinks.update({"iq": Sink(ib + "_bbo.csv"), "it": Sink(ib + "_trades.csv"), "ia": Sink(ib + "_auction.csv"),
@@ -261,7 +263,7 @@ def do_day(day, a, raw):
              "glbx": subprocess.Popen([sys.executable, feed, cme_bin, "--secids", ",".join([nq_for(tag)] + ([a.extra_secids] if a.extra_secids else [])), "--display-factor", "0.01", "--depth", str(DEPTH), "--threads", str(a.cme_threads),
                                        "--out", gb] + (["--port", str(a.cme_port)] if a.cme_port else []) + ["--"] + cme, stdout=lf, stderr=subprocess.STDOUT)}
     if iex:
-        procs["iex"] = subprocess.Popen([sys.executable, os.path.join(HERE, "iex_parse.py"), "--symbols", SYMS, "--out", ib,
+        procs["iex"] = subprocess.Popen([a.iex_python or sys.executable, os.path.join(HERE, "iex_parse.py"), "--symbols", SYMS, "--out", ib,
                                          "--start-ns", str(t0), "--end-ns", str(t1)] + iex, stdout=lf, stderr=subprocess.STDOUT)
     while any(p.poll() is None for p in procs.values()):
         if free_gb(a.out_dir) < a.min_free_gb:
@@ -287,6 +289,8 @@ def do_day(day, a, raw):
     write(cr.select(["ts_recv_ns", "ts_event_ns", "symbol", "price", "size", "cross_type", "match_no"]), out("crosses"))
     n = T["xn"] if T["xn"] is not None else pa.table({"ts_event_ns": pa.array([], pa.int64())})
     write(n, out("noii"))
+    if T["xm"] is not None:
+        write(T["xm"], out("mpid"))                  # attributed adds: which firm posted which order
     parts.append(conform(T["gq"], {"venue": "GLBX", "type": "Q"}))
     if T["gt"] is not None:
         parts.append(conform(T["gt"].rename_columns(["trade_id" if c == "rpt_seq" else c for c in T["gt"].column_names]), {"venue": "GLBX", "type": "T"}))
@@ -327,6 +331,7 @@ def main():
     ap.add_argument("--out-dir", default=os.path.expanduser("~/myproject/pull_out"))
     ap.add_argument("--min-free-gb", type=float, default=5.0)
     ap.add_argument("--cme-port", type=int, default=0, help="UDP port of NQ's CME channel: skip all other channels before decoding")
+    ap.add_argument("--iex-python", default="", help="interpreter for iex_parse.py, e.g. ~/pypy/bin/pypy3 (~10x faster)")
     ap.add_argument("--extra-secids", default="", help="more CME contracts on the same channel, e.g. MNQM5=123,ESM5=456 (label=SecurityID)")
     ap.add_argument("--cme-threads", type=int, default=16)
     ap.add_argument("--nq-night", action="store_true", help="NQ only, 20:00 ET previous evening -> 04:00 ET (book built from 18:00)")

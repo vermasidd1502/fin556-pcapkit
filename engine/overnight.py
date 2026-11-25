@@ -78,6 +78,7 @@ def main():
     ap.add_argument("--day-gb", type=float, default=1.5, help="disk room reserved per parallel day")
     ap.add_argument("--cme-threads", type=int, default=16)
     ap.add_argument("--extra-secids", default="")
+    ap.add_argument("--iex-python", default="")
     ap.add_argument("--nq-night", action="store_true", help="NQ-only overnight pass (20:00 prev -> 04:00); use its own --work/--state")
     ap.add_argument("--rclone", default=os.path.expanduser("~/bin/rclone"))
     ap.add_argument("--retries", type=int, default=5)
@@ -137,6 +138,8 @@ def main():
                 cmd += ["--cme-port", str(a.cme_port)]
             if a.extra_secids:
                 cmd += ["--extra-secids", a.extra_secids]
+            if a.iex_python:
+                cmd += ["--iex-python", a.iex_python]
             if a.nq_night:
                 cmd += ["--nq-night"]
             procs[d] = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
