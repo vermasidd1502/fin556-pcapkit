@@ -139,6 +139,10 @@ Measured so far:
 - First full day on the VM (before the channel filter and parallel days): ~40 min. Re-measurement with the channel
   filter, parallel days and PyPy is in progress.
 
+Core usage (defaults): each day runs ~27 threads (CME: 8 readers/decompressors + dispatcher + 12 book shards +
+merger + writer; Nasdaq parser + decompressor; IEX parser; Parquet writer), and up to 8 days run at once (~215
+threads). The earlier version kept ~3 cores busy; the number of parallel days is currently capped by free disk.
+
 Where the time goes: CME captures carry every CME product, so even with the channel filter the files must be read
 and decompressed in full; the IEX capture is one file per day. Parallelism is across days and feeds; a single day's
 CME is never split, because the order book must run continuously.
