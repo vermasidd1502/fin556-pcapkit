@@ -164,6 +164,8 @@ def main():
     ap.add_argument("--extra-secids", default="", help="extra CME contracts inline (added to --secids-file)")
     ap.add_argument("--venues", default="xnas,glbx,iex", help="feeds to parse; e.g. xnas for a Nasdaq-only local run")
     ap.add_argument("--xnas-remote", default="", help="Nasdaq captures from an rclone remote, e.g. box:db/xnas_pcaps")
+    ap.add_argument("--skip-days-file", default="", help="extra list of days already done (one YYYYMMDD per line); never re-pulled")
+    ap.add_argument("--start-batch", type=int, default=0, help="next batch number to use (if the state file was lost)")
     ap.add_argument("--nq-night", action="store_true", help="NQ-only overnight pass; use its own --work and --state")
     ap.add_argument("--rclone", default=D["rclone"])
     ap.add_argument("--retries", type=int, default=D["retries"])
@@ -190,6 +192,10 @@ def main():
             os.remove(p)
 
     st = State(a.state)
+    if a.skip_days_file and os.path.exists(a.skip_days_file):  # days already pulled elsewhere / before a cleanup
+        st.done |= {w for l in open(a.skip_days_file) for w in l.split() if w.isdigit() and len(w) == 8}
+    if a.start_batch:
+        st.last_batch = max(st.last_batch, a.start_batch - 1)
     todo = center_out([d for d in weekdays(a.d0, a.d1) if d not in st.done | st.skipped | staged], a.center)
     log(f"start: {len(todo)} days to pull, {len(staged)} staged, {len(st.done)} done, {len(st.skipped)} skipped; "
         f"free {free_gb(a.work):.1f} GB; jobs {a.jobs}; cme port {a.cme_port}; extra contracts {secids.count('=')}; "
