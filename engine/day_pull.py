@@ -383,7 +383,8 @@ def main():
     if not a.dry_run and not a.nq_night and not os.access(os.path.join(HERE, "itch_noii"), os.X_OK):
         raise SystemExit("build first: g++ -O3 -std=c++17 -o itch_noii itch_noii.cpp")
     os.makedirs(a.out_dir, exist_ok=True)
-    raw = os.path.join(a.out_dir, "raw"); os.makedirs(raw, exist_ok=True)
+    # private temp folder per process: several day_pull processes share one --out-dir when days run in parallel
+    raw = os.path.join(a.out_dir, "raw", f"{a.d0}_{os.getpid()}"); os.makedirs(raw, exist_ok=True)
     print(f"free disk {free_gb(a.out_dir):.1f} GB (stop below {a.min_free_gb}); window {a.start}-{a.end} ET")
     T0, ok, tot = time.time(), 0, 0
     for day in daterange(a.d0, a.d1):
@@ -396,7 +397,11 @@ def main():
             ok += bool((do_nq_night if a.nq_night else do_day)(day, a, raw))
         except Exception as e:                       # keep going; report the day as incomplete
             print(f"INCOMPLETE {day:%Y%m%d} | all | {type(e).__name__}: {e}", flush=True)
-    shutil.rmtree(raw, ignore_errors=True)
+    shutil.rmtree(raw, ignore_errors=True)            # only this process's own folder
+    try:
+        os.rmdir(os.path.dirname(raw))               # remove the shared parent only if it is now empty
+    except OSError:
+        pass
     print(f"done: {ok}/{tot} days in {time.time() - T0:.0f}s; free disk {free_gb(a.out_dir):.1f} GB")
 
 
