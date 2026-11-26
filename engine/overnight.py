@@ -30,7 +30,7 @@ HOME = os.path.expanduser("~")
 DEFAULTS = dict(
     d0="20250203", d1="20250430", center="20250402",
     work=f"{HOME}/myproject/overnight", state=f"{HOME}/myproject/overnight_done.txt",
-    remote="hold", batch_gb=100.0, min_free_gb=1.0, day_gb=1.0,
+    remote="hold", batch_gb=100.0, min_free_gb=1.0, day_gb=2.5,
     jobs=8, cme_threads=32, cme_port=14318,
     iex_glob="/md/iex_pcaps/data_feeds_{date}_{date}_IEXTP1_DEEP1.0.pcap.gz",
     iex_python=f"{HOME}/pypy/bin/pypy3",                    # used only if it exists
@@ -214,13 +214,21 @@ def main():
         log(f"{'SAVED' if a.remote == 'keep' else 'SHIPPED'} batch_{n:02d}: {len(days)} days ({', '.join(days)}), "
             f"{gb:.2f} GB; free {free_gb(a.work):.1f} GB")
 
-    def room():
-        return int((free_gb(a.work) - a.min_free_gb - 2) // a.day_gb)
+    sizes = []                                                # GB written per finished day (learned as we go)
 
-    i = 0
+    def day_need():
+        """disk to reserve per parallel day: the --day-gb floor, or 1.3x the median finished day, whichever is larger"""
+        if not sizes:
+            return a.day_gb
+        return max(a.day_gb, 1.3 * sorted(sizes)[len(sizes) // 2])
+
+    def room():
+        return int((free_gb(a.work) - a.min_free_gb - 2) // day_need())
+
+    attempts, i = {}, 0
     while i < len(todo):
-        if room() < min(a.jobs, len(todo) - i):
-            flush(force=True)                                 # make room by shipping what is staged
+        if room() < 1:
+            flush(force=True)                                 # ship only when not even one more day fits
         if room() < 1:
             wait_until(lambda: room() >= 1, f"for disk (free {free_gb(a.work):.1f} GB; another user may be using it)", a)
         group = todo[i:i + max(1, min(a.jobs, room(), len(todo) - i))]
@@ -248,7 +256,10 @@ def main():
                     log(line)
             if os.path.exists(os.path.join(stage, f"{key}{d}.parquet")):
                 staged.add(d)
-                log(f"{d}: ok in {secs:.0f}s ({len(group)} in parallel); staged {du_gb(stage):.2f} GB ({i + 1}/{len(todo)})")
+                day_gb = sum(os.path.getsize(os.path.join(stage, f)) for f in os.listdir(stage) if d in f) / 1e9
+                sizes.append(day_gb)
+                log(f"{d}: ok in {secs:.0f}s ({len(group)} in parallel); day {day_gb:.2f} GB; staged {du_gb(stage):.2f} GB; "
+                    f"reserving {day_need():.1f} GB/day ({i + 1}/{len(todo)})")
             else:
                 for f in os.listdir(stage):                   # drop partial files of this day
                     if d in f and os.path.isfile(os.path.join(stage, f)):
@@ -256,8 +267,12 @@ def main():
                 if "| all | missing files" in out:
                     st.mark_skip(d, "no-data-on-vm")          # holiday or capture gap: never retried
                     log(f"{d}: skipped (no data on the VM) ({i + 1}/{len(todo)})")
-                else:                                         # parser problem: retried on the next run
-                    log(f"INCOMPLETE {d} | parse failed (exit {procs[d].returncode}); retried next run: {err.strip()[-200:]}")
+                elif attempts.get(d, 0) < 1:                  # retry once later in this run (often a disk squeeze)
+                    attempts[d] = attempts.get(d, 0) + 1
+                    todo.append(d)
+                    log(f"INCOMPLETE {d} | parse failed (exit {procs[d].returncode}); requeued: {(err or out).strip()[-160:]}")
+                else:
+                    log(f"INCOMPLETE {d} | parse failed twice; left for the next run: {(err or out).strip()[-160:]}")
             i += 1
         flush(force=False)
     flush(force=True)
