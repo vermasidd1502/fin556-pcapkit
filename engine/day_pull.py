@@ -218,7 +218,16 @@ def remote_files(a, remote, day, t0, t1):
     """Same selection as select_files, but listing a cloud folder with `rclone lsf` (names only)."""
     out = []
     for dd in (day - timedelta(days=1), day, day + timedelta(days=1)):
-        r = subprocess.run([a.rclone, "lsf", "--files-only", f"{remote}/{dd:%Y%m%d}"], capture_output=True, text=True)
+        r = None
+        for attempt in range(4):                      # transient network/auth errors: retry with backoff
+            r = subprocess.run([a.rclone, "lsf", "--files-only", "--retries", "5", f"{remote}/{dd:%Y%m%d}"],
+                               capture_output=True, text=True)
+            if r.returncode == 0 or "directory not found" in r.stderr.lower():
+                break
+            time.sleep(30 * (attempt + 1))
+        if r.returncode != 0 and "directory not found" not in r.stderr.lower():
+            # never treat "could not list" as "no data": raise so the day is retried, not skipped
+            raise RuntimeError(f"cloud listing failed for {remote}/{dd:%Y%m%d}: {r.stderr.strip()[-160:]}")
         for name in r.stdout.split():
             m = FN.search(name)
             if not m:
