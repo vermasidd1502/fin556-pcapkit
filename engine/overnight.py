@@ -124,9 +124,10 @@ def ship(a, stage, n):
                 tf.add(os.path.join(stage, f), arcname=f"batch_{n:02d}/{f}")
                 os.remove(os.path.join(stage, f))
         os.rename(tar + ".part", tar)
-        log(f"READY {tar} ({os.path.getsize(tar) / 1e9:.2f} GB) - download it, then: rm {tar}")
-        wait_until(lambda: not os.path.exists(tar), f"for {os.path.basename(tar)} to be downloaded and deleted", a)
-        return True
+        waiting = sorted(f for f in os.listdir(ready) if f.endswith(".tar"))
+        log(f"READY {tar} ({os.path.getsize(tar) / 1e9:.2f} GB) - download it, then: rm {tar}  "
+            f"[{len(waiting)} tar(s) waiting: {', '.join(waiting)}]")
+        return True                                       # don't block: keep parsing while disk allows
     dest = f"{a.remote}/batch_{n:02d}"                        # rclone route (if the remote is reachable)
     for attempt in range(1, a.retries + 1):
         r = subprocess.run([a.rclone, "copy", stage, dest, "--transfers", "4", "--stats", "0", "--log-level", "ERROR"],
@@ -237,7 +238,8 @@ def main():
         if room() < 1:
             flush(force=True)                                 # ship only when not even one more day fits
         if room() < 1:
-            wait_until(lambda: room() >= 1, f"for disk (free {free_gb(a.work):.1f} GB; another user may be using it)", a)
+            wait_until(lambda: room() >= 1, f"for disk (free {free_gb(a.work):.1f} GB; download+delete waiting tars in "
+                       f"{os.path.join(a.work, 'ready')} or wait for other users to free space)", a)
         group = todo[i:i + max(1, min(a.jobs, room(), len(todo) - i))]
         t0 = time.time(); procs = {}
         for d in group:
