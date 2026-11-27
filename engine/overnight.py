@@ -164,6 +164,7 @@ def main():
     ap.add_argument("--extra-secids", default="", help="extra CME contracts inline (added to --secids-file)")
     ap.add_argument("--venues", default="xnas,glbx,iex", help="feeds to parse; e.g. xnas for a Nasdaq-only local run")
     ap.add_argument("--xnas-remote", default="", help="Nasdaq captures from an rclone remote, e.g. box:db/xnas_pcaps")
+    ap.add_argument("--headroom-gb", type=float, default=0.5, help="extra space kept above the floor when deciding to start a day")
     ap.add_argument("--skip-days-file", default="", help="extra list of days already done (one YYYYMMDD per line); never re-pulled")
     ap.add_argument("--start-batch", type=int, default=0, help="next batch number to use (if the state file was lost)")
     ap.add_argument("--nq-night", action="store_true", help="NQ-only overnight pass; use its own --work and --state")
@@ -226,10 +227,10 @@ def main():
         """disk to reserve per parallel day: the --day-gb floor, or 1.3x the median finished day, whichever is larger"""
         if not sizes:
             return a.day_gb
-        return max(a.day_gb, 1.3 * sorted(sizes)[len(sizes) // 2])
+        return max(a.day_gb, 1.15 * sorted(sizes)[len(sizes) // 2])
 
     def room():
-        return int((free_gb(a.work) - a.min_free_gb - 2) // day_need())
+        return int((free_gb(a.work) - a.min_free_gb - a.headroom_gb) // day_need())
 
     attempts, i = {}, 0
     while i < len(todo):
