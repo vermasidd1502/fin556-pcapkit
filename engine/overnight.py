@@ -63,6 +63,16 @@ def weekdays(d0, d1):
     return out
 
 
+def edges_in(days):
+    """first, last, 2nd, 2nd-last ... (outside-in: for a teammate working toward the middle)."""
+    days, out = list(days), []
+    while days:
+        out.append(days.pop(0))
+        if days:
+            out.append(days.pop())
+    return out
+
+
 def center_out(days, center):
     """center, +1, -1, +2, -2 ... in trading-day steps (ties: later day first)."""
     if not center or not days:
@@ -150,6 +160,8 @@ def main():
     ap.add_argument("--from", dest="d0", default=D["d0"])
     ap.add_argument("--to", dest="d1", default=D["d1"])
     ap.add_argument("--center", default=D["center"], help="pull outward from this day; '' = calendar order")
+    ap.add_argument("--order", choices=["center", "edges"], default="center",
+                    help="center = tariff day outward (default); edges = Feb 3 / Apr 30 inward (teammate split)")
     ap.add_argument("--work", default=D["work"])
     ap.add_argument("--state", default=D["state"])
     ap.add_argument("--remote", default=D["remote"], help="'hold' (download by hand), 'keep' (local run) or an rclone remote:path")
@@ -198,10 +210,11 @@ def main():
         st.done |= {w for l in open(a.skip_days_file) for w in l.split() if w.isdigit() and len(w) == 8}
     if a.start_batch:
         st.last_batch = max(st.last_batch, a.start_batch - 1)
-    todo = center_out([d for d in weekdays(a.d0, a.d1) if d not in st.done | st.skipped | staged], a.center)
+    left = [d for d in weekdays(a.d0, a.d1) if d not in st.done | st.skipped | staged]
+    todo = edges_in(left) if a.order == "edges" else center_out(left, a.center)
     log(f"start: {len(todo)} days to pull, {len(staged)} staged, {len(st.done)} done, {len(st.skipped)} skipped; "
         f"free {free_gb(a.work):.1f} GB; jobs {a.jobs}; cme port {a.cme_port}; extra contracts {secids.count('=')}; "
-        f"iex {'pypy' if iex_python else 'python'}; order {'center ' + a.center if a.center else 'calendar'}")
+        f"iex {'pypy' if iex_python else 'python'}; order {'edges-in' if a.order == 'edges' else ('center ' + a.center if a.center else 'calendar')}")
 
     def flush(force):
         nonlocal staged

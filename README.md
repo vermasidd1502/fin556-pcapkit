@@ -190,3 +190,26 @@ test/make_fake_pcaps.py      synthetic captures for testing without licensed dat
 - On the shared VM: work in your own folder, no sudo, keep free disk above the floor, clean up after each run.
 - Shared as a starting point by FIN 556 students. Use at your own risk; you are responsible for following the
   course and data rules. Credit appreciated if you reuse it.
+
+## Team split: two people parsing Nasdaq from Box at once
+
+Siddharth's Mac runs **center-out** (Apr 2 first, then outward). A teammate runs **edges-in** (Feb 3, Apr 30, Feb 4, Apr 29, ...), so the two runs meet in the middle without parsing the same days.
+
+The teammate's range is **2025-02-03 → 2025-02-28 and 2025-04-24 → 2025-04-30** (about 23 trading days). Days already finished elsewhere are listed in `team_done_days.txt` and are skipped.
+
+Setup (Mac or Linux, about 30 GB free; Illinois Box access to the professor's share):
+```bash
+git clone https://github.com/vermasidd1502/fin556-pcapkit && cd fin556-pcapkit/engine
+pip3 install pyarrow zstandard numpy pandas
+bash build.sh && g++ -O3 -std=c++17 -o itch_noii itch_noii.cpp
+# rclone with a Box remote named "box" (rclone config -> new remote -> box -> sign in with Illinois SSO)
+```
+Run it (resumes automatically if stopped; stop with `pkill -f overnight.py`):
+```bash
+nohup python3 overnight.py --venues xnas --xnas-remote box:db/xnas_pcaps --rclone "$(which rclone)" \
+  --order edges --from 20250203 --to 20250430 --skip-days-file ../team_done_days.txt \
+  --remote keep --batch-gb 0 --jobs 4 --min-free-gb 20 --iex-glob '' --secids-file /dev/null \
+  --work ~/fin556_pull --state ~/fin556_pull/done.txt >> ~/fin556_pull.log 2>&1 &
+grep -E "start:|ok in|ALL DONE" ~/fin556_pull.log | tail
+```
+**Stop when you reach Feb 28 on one side and Apr 24 on the other** (or when Siddharth says the middle is done). The outputs go to `~/fin556_pull/stage/` (`ticks_YYYYMMDD.parquet`, etc.). Upload them to the team's Illinois Box folder only, never to a personal cloud or an AI tool.
